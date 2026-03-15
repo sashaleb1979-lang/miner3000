@@ -164,7 +164,7 @@ function applyDbDefaults() {
     globalRowWeights: { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1 },
     evaluatorWeights: {},
     targetBiases: {},
-    rowInfluenceWeights: { "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 },
+    rowInfluenceWeights: { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1, new: 1 },
   };
   db.comments ||= {};
 
@@ -179,13 +179,11 @@ function applyDbDefaults() {
     db.config.coefficients.globalRowWeights[key] = Number.isFinite(raw) && raw > 0 ? raw : 1;
   }
   for (const key of ["5", "4", "3", "2", "1", "unknown", "new"]) {
-    const fallback = ({ "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 })[key] || 1;
-    const raw = Number(db.config.coefficients.rowInfluenceWeights?.[key]);
-    db.config.coefficients.rowInfluenceWeights[key] = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+    db.config.coefficients.rowInfluenceWeights[key] = 1;
   }
   db.config.coefficients.evaluatorWeights ||= {};
   db.config.coefficients.targetBiases ||= {};
-  db.config.coefficients.rowInfluenceWeights ||= { "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 };
+  db.config.coefficients.rowInfluenceWeights ||= { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1, new: 1 };
 
   db.config.graphicTierlist ||= {
     title: GRAPHIC_TIERLIST_TITLE,
@@ -578,7 +576,7 @@ function clearPersonCoefficients(userId) {
 function getRowInfluenceWeight(rowId) {
   const key = canonicalRowId(rowId) || "new";
   const raw = Number(getCoefficientConfig().rowInfluenceWeights?.[key]);
-  const fallback = ({ "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 })[key] || 1;
+  const fallback = ({ "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1, new: 1 })[key] || 1;
   return Number.isFinite(raw) && raw > 0 ? raw : fallback;
 }
 
@@ -1473,7 +1471,7 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
 
   const neededH = topY + rowLayout.reduce((sum, r) => sum + r.rowH, 0) + footerH;
   const H = Math.max(H_CFG, neededH);
-  const title = options.title || `Личный тир-лист`;
+  const title = options.title || `${db.config.graphicTierlist?.title || GRAPHIC_TIERLIST_TITLE} · личный`;
 
   const img = PImage.make(W, H);
   const ctx = img.getContext("2d");
@@ -1484,7 +1482,7 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
   ctx.fillText(title, 40, 82);
   fillColor(ctx, "#cfcfcf");
   setGraphicFont(ctx, 22, "regular");
-  ctx.fillText(`личных голосов: ${total}. draft включён: ${options.includeDraft !== false ? "yes" : "no"}.`, 40, H - 18);
+  ctx.fillText(`личных голосов: ${total}. черновик: ${options.includeDraft !== false ? "вкл" : "выкл"}.`, 40, H - 18);
 
   let yCursor = topY;
   for (const row of rowLayout) {
@@ -1503,10 +1501,11 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
     const bottomLabelY = y + blockH - 18;
     const titleBoxY = y + 16;
     const titleBoxH = Math.max(44, bottomLabelY - titleBoxY - 18);
-    drawGraphicTierTitle(ctx, rowId === "unknown" ? "не знаю" : `тир ${rowId}`, labelX, titleBoxY, labelW, titleBoxH);
+    const rowLabel = getRowLabel(rowId);
+    drawGraphicTierTitle(ctx, rowLabel, labelX, titleBoxY, labelW, titleBoxH);
     fillColor(ctx, "#111111");
     setGraphicFont(ctx, 24, "regular");
-    ctx.fillText(rowId === "unknown" ? "UNKNOWN" : `TIER ${rowId}`, labelX, bottomLabelY);
+    ctx.fillText(String(rowLabel || rowId).toUpperCase(), labelX, bottomLabelY);
 
     const rightX = leftW + 24;
     const rightY = y + 18;
@@ -1537,14 +1536,7 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
         fillColor(ctx, "#555555");
         ctx.fillRect(x, yy, rowIcon, rowIcon);
       }
-      const usernameBarH = Math.max(18, Math.floor(rowIcon * 0.24));
-      ctx.fillStyle = "rgba(0,0,0,0.78)";
-      ctx.fillRect(x, yy + rowIcon - usernameBarH, rowIcon, usernameBarH);
-      const usernameFit = fitGraphicSingleLineText(ctx, String(player.username || player.name || player.userId || "").trim(), "bold", Math.max(10, rowIcon - 10), Math.max(10, Math.floor(rowIcon * 0.18)), 9);
-      setGraphicFont(ctx, usernameFit.px, "bold");
-      ctx.fillStyle = "rgba(255,255,255,0.98)";
-      const usernameY = yy + rowIcon - Math.max(5, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
-      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
+      drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon);
     }
   }
 
@@ -1569,13 +1561,15 @@ async function buildMyStatusPayload(client, userId) {
   const lastTarget = session?.lastCompletedTargetId ? db.people?.[session.lastCompletedTargetId] : null;
   const historyLines = buildSessionHistoryLines(userId, 8);
   const anonymousComments = getAnonymousCommentsForTarget(userId, 8);
-  const detailedGiven = buildDetailedGivenLines(userId, 12);
+  const evaluatorWeight = getEvaluatorWeight(userId);
+  const rowInfluence = getEvaluatorRowInfluence(userId);
+  const effectiveInfluence = evaluatorWeight * rowInfluence;
 
   const summary = new EmbedBuilder()
     .setTitle("Мой статус")
     .setDescription([
       person
-        ? `Ты в пуле оцениваемых. Текущая обычная строка: **${getRowLabel(rowId)}**. Влияние твоих голосов по строке: **x${getEvaluatorRowInfluence(userId).toFixed(2)}**.`
+        ? `Ты в пуле оцениваемых. Текущая обычная строка: **${getRowLabel(rowId)}**. Влияние твоих голосов: **x${effectiveInfluence.toFixed(2)}**.`
         : "Тебя ещё нет в пуле оцениваемых. Кнопка «Начать оценку» автоматически добавит тебя.",
       `Прогресс оценки: **${given.total}/${eligible}**. Осталось: **${remaining}**. Готовность: **${progressPct}%**.`,
       `Ты выдал обычных оценок: **${given.known}**. Нажатий «Не знаю»: **${given.unknown}**.`,
@@ -1586,30 +1580,25 @@ async function buildMyStatusPayload(client, userId) {
       activeTarget ? `Сейчас на очереди: **${activeTarget.username || activeTarget.name || activeTarget.userId}**.` : "Активной карточки сейчас нет.",
       lastTarget ? `Последний человек: **${lastTarget.username || lastTarget.name || lastTarget.userId}**. Последний выбор: **${session?.lastVoteValue === "unknown" ? "Не знаю" : session?.lastVoteValue || "—"}**.` : null,
       session?.lastCommittedAt ? `Последнее слияние в общий тир-лист: **${session.lastCommittedAt}**.` : null,
+      effectiveInfluence !== 1 ? `Коэффициент повышен через настройки. Базово у всех **x1**.` : `Базово у всех влияние **x1**. Повышение возможно только командами настройки коэффициентов.`,
     ].filter(Boolean).join("\n"));
 
   const details = new EmbedBuilder()
     .setTitle("Подробности")
     .addFields(
-      { name: "Мои последние оценки", value: detailedGiven.length ? detailedGiven.join("\n") : "Пока пусто.", inline: false },
       { name: "История сессии", value: historyLines.length ? historyLines.join("\n") : "Пока пусто.", inline: false },
       { name: "Анонимные комментарии обо мне", value: anonymousComments.length ? anonymousComments.map((item, i) => `**${i + 1}.** ${item.text}`).join("\n\n") : "Пока нет.", inline: false },
     );
 
-  const personal = new EmbedBuilder()
-    .setTitle("Мой личный тир-лист")
-    .setDescription("Это твой последний личный расклад. Внутри уже учтён черновик, если сессия ещё не закончена.")
-    .addFields(buildPersonalTierFields(userId, { includeDraft: true }));
-
   const payload = {
-    embeds: [summary, details, personal],
+    embeds: [summary, details],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
     )],
     ephemeral: true,
   };
-  const png = await renderPersonalTierlistPng(client, userId, { includeDraft: true, title: `Личный тир-лист ${person?.username || person?.name || userId}` }).catch(() => null);
+  const png = await renderPersonalTierlistPng(client, userId, { includeDraft: true, title: `${db.config.graphicTierlist?.title || GRAPHIC_TIERLIST_TITLE} · ${person?.username || person?.name || userId}` }).catch(() => null);
   if (png) {
     const fileName = `personal-tierlist-${sanitizeFileName(userId, "png")}`;
     const attachment = new AttachmentBuilder(png, { name: fileName });
@@ -1930,6 +1919,49 @@ function drawGraphicOutlinedText(ctx, text, x, y, fill = "#ffffff", outline = "#
   ctx.fillText(text, x, y);
 }
 
+
+function drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon) {
+  const displayName = String(player?.name || player?.username || player?.userId || "").trim();
+  const displayUsername = String(player?.username || player?.name || player?.userId || "").trim();
+
+  const topBarH = Math.max(14, Math.floor(rowIcon * 0.18));
+  const bottomBarH = Math.max(18, Math.floor(rowIcon * 0.24));
+
+  if (displayName) {
+    ctx.fillStyle = "rgba(0,0,0,0.72)";
+    ctx.fillRect(x, yy, rowIcon, topBarH);
+    const nameFit = fitGraphicSingleLineText(
+      ctx,
+      displayName,
+      "bold",
+      Math.max(10, rowIcon - 10),
+      Math.max(9, Math.floor(rowIcon * 0.145)),
+      8,
+    );
+    setGraphicFont(ctx, nameFit.px, "bold");
+    ctx.fillStyle = "rgba(255,255,255,0.98)";
+    const nameY = yy + Math.max(7, Math.floor((topBarH + nameFit.px) / 2) - 2);
+    ctx.fillText(nameFit.text, centerGraphicTextX(ctx, nameFit.text, x, rowIcon), nameY);
+  }
+
+  if (displayUsername) {
+    ctx.fillStyle = "rgba(0,0,0,0.78)";
+    ctx.fillRect(x, yy + rowIcon - bottomBarH, rowIcon, bottomBarH);
+    const usernameFit = fitGraphicSingleLineText(
+      ctx,
+      displayUsername,
+      "bold",
+      Math.max(10, rowIcon - 10),
+      Math.max(10, Math.floor(rowIcon * 0.18)),
+      9,
+    );
+    setGraphicFont(ctx, usernameFit.px, "bold");
+    ctx.fillStyle = "rgba(255,255,255,0.98)";
+    const usernameY = yy + rowIcon - Math.max(5, Math.floor((bottomBarH - usernameFit.px) / 2)) - 1;
+    ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
+  }
+}
+
 function drawGraphicTierTitle(ctx, text, boxX, boxY, boxW, boxH) {
   const fit = fitGraphicWrappedText(ctx, text, "bold", boxW, boxH, 56, 22, 3);
   fillColor(ctx, "#111111");
@@ -2191,22 +2223,7 @@ async function renderGraphicTierlistPng(client = null) {
         ctx.fillText(initials, ix, iy);
       }
 
-      const usernameBarH = Math.max(18, Math.floor(rowIcon * 0.24));
-      ctx.fillStyle = "rgba(0,0,0,0.78)";
-      ctx.fillRect(x, yy + rowIcon - usernameBarH, rowIcon, usernameBarH);
-
-      const usernameFit = fitGraphicSingleLineText(
-        ctx,
-        String(player.username || player.name || player.userId || "").trim(),
-        "bold",
-        Math.max(10, rowIcon - 10),
-        Math.max(10, Math.floor(rowIcon * 0.18)),
-        9,
-      );
-      setGraphicFont(ctx, usernameFit.px, "bold");
-      ctx.fillStyle = "rgba(255,255,255,0.98)";
-      const usernameY = yy + rowIcon - Math.max(5, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
-      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
+      drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon);
 
     }
   }
