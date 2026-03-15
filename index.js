@@ -1650,14 +1650,7 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
         fillColor(ctx, "#555555");
         ctx.fillRect(x, yy, rowIcon, rowIcon);
       }
-      const usernameBarH = Math.max(18, Math.floor(rowIcon * 0.24));
-      ctx.fillStyle = "rgba(0,0,0,0.78)";
-      ctx.fillRect(x, yy + rowIcon - usernameBarH, rowIcon, usernameBarH);
-      const usernameFit = fitGraphicSingleLineText(ctx, String(player.username || player.name || player.userId || "").trim(), "bold", Math.max(10, rowIcon - 10), Math.max(10, Math.floor(rowIcon * 0.18)), 9);
-      setGraphicFont(ctx, usernameFit.px, "bold");
-      ctx.fillStyle = "rgba(255,255,255,0.98)";
-      const usernameY = yy + rowIcon - Math.max(5, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
-      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
+      drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon);
     }
   }
 
@@ -2048,6 +2041,48 @@ function drawGraphicOutlinedText(ctx, text, x, y, fill = "#ffffff", outline = "#
   ctx.fillText(text, x, y);
 }
 
+function drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon) {
+  const displayName = String(player?.name || player?.username || player?.userId || "").trim();
+  const displayUsername = String(player?.username || player?.name || player?.userId || "").trim();
+
+  const topBarH = Math.max(14, Math.floor(rowIcon * 0.18));
+  const bottomBarH = Math.max(18, Math.floor(rowIcon * 0.24));
+
+  if (displayName) {
+    ctx.fillStyle = "rgba(0,0,0,0.72)";
+    ctx.fillRect(x, yy, rowIcon, topBarH);
+    const nameFit = fitGraphicSingleLineText(
+      ctx,
+      displayName,
+      "bold",
+      Math.max(10, rowIcon - 10),
+      Math.max(9, Math.floor(rowIcon * 0.145)),
+      8,
+    );
+    setGraphicFont(ctx, nameFit.px, "bold");
+    ctx.fillStyle = "rgba(255,255,255,0.98)";
+    const nameY = yy + Math.max(7, Math.floor((topBarH + nameFit.px) / 2) - 2);
+    ctx.fillText(nameFit.text, centerGraphicTextX(ctx, nameFit.text, x, rowIcon), nameY);
+  }
+
+  if (displayUsername) {
+    ctx.fillStyle = "rgba(0,0,0,0.78)";
+    ctx.fillRect(x, yy + rowIcon - bottomBarH, rowIcon, bottomBarH);
+    const usernameFit = fitGraphicSingleLineText(
+      ctx,
+      displayUsername,
+      "bold",
+      Math.max(10, rowIcon - 10),
+      Math.max(10, Math.floor(rowIcon * 0.18)),
+      9,
+    );
+    setGraphicFont(ctx, usernameFit.px, "bold");
+    ctx.fillStyle = "rgba(255,255,255,0.98)";
+    const usernameY = yy + rowIcon - Math.max(5, Math.floor((bottomBarH - usernameFit.px) / 2)) - 1;
+    ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
+  }
+}
+
 function drawGraphicTierTitle(ctx, text, boxX, boxY, boxW, boxH) {
   const fit = fitGraphicWrappedText(ctx, text, "bold", boxW, boxH, 56, 22, 3);
   fillColor(ctx, "#111111");
@@ -2309,22 +2344,7 @@ async function renderGraphicTierlistPng(client = null) {
         ctx.fillText(initials, ix, iy);
       }
 
-      const usernameBarH = Math.max(18, Math.floor(rowIcon * 0.24));
-      ctx.fillStyle = "rgba(0,0,0,0.78)";
-      ctx.fillRect(x, yy + rowIcon - usernameBarH, rowIcon, usernameBarH);
-
-      const usernameFit = fitGraphicSingleLineText(
-        ctx,
-        String(player.username || player.name || player.userId || "").trim(),
-        "bold",
-        Math.max(10, rowIcon - 10),
-        Math.max(10, Math.floor(rowIcon * 0.18)),
-        9,
-      );
-      setGraphicFont(ctx, usernameFit.px, "bold");
-      ctx.fillStyle = "rgba(255,255,255,0.98)";
-      const usernameY = yy + rowIcon - Math.max(5, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
-      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
+      drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon);
 
     }
   }
