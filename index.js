@@ -130,8 +130,16 @@ function loadDB() {
   }
 }
 
+function ensureDirForFile(filePath) {
+  const dir = path.dirname(filePath);
+  if (dir) fs.mkdirSync(dir, { recursive: true });
+}
+
 function saveDB(db) {
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+  ensureDirForFile(DB_PATH);
+  const tmpPath = `${DB_PATH}.tmp`;
+  fs.writeFileSync(tmpPath, JSON.stringify(db, null, 2), "utf8");
+  fs.renameSync(tmpPath, DB_PATH);
 }
 
 const db = loadDB();
@@ -1184,7 +1192,8 @@ function ensureGraphicFonts() {
     GRAPHIC_FONT_INFO.loadError = null;
     graphicFontsReady = true;
     return true;
-  } catch (err) {
+  }
+  catch (err) {
     GRAPHIC_FONT_INFO.loadError = String(err?.message || err || "font load failed");
     graphicFontsReady = false;
     return false;
@@ -1590,6 +1599,22 @@ async function renderGraphicTierlistPng(client = null) {
   return Buffer.concat(chunks);
 }
 
+let graphicRefreshPromise = Promise.resolve(false);
+
+function scheduleGraphicTierlistRefresh(client) {
+  graphicRefreshPromise = graphicRefreshPromise
+    .catch(() => false)
+    .then(async () => {
+      try {
+        return await refreshGraphicTierlist(client);
+      } catch (err) {
+        console.error("Graphic refresh failed:", err?.message || err);
+        return false;
+      }
+    });
+  return graphicRefreshPromise;
+}
+
 function buildGraphicDashboardComponents() {
   return [
     new ActionRowBuilder().addComponents(
@@ -1862,7 +1887,32 @@ client.once("ready", async () => {
   console.log("Ready");
 });
 
+function getInteractionPayloadErrorMessage(err) {
+  const message = String(err?.message || err || "Ошибка");
+  if (/ENOENT|EACCES|EPERM|read-only|rename/i.test(message)) return "Проблема с памятью или записью файлов. Проверь volume и DB_PATH.";
+  if (/Unknown interaction|10062/i.test(message)) return "Интеракция уже протухла. Нажми кнопку заново.";
+  if (/Cannot send messages|Missing Access|Missing Permissions|50013/i.test(message)) return "У бота не хватает прав в этом канале.";
+  if (/pureimage|font|PNG/i.test(message)) return "Проблема при сборке PNG. Проверь pureimage и шрифты.";
+  return message.slice(0, 1800);
+}
+
+async function replyInteractionError(interaction, err) {
+  const content = `Ошибка. ${getInteractionPayloadErrorMessage(err)}`;
+  try {
+    if (interaction.deferred) {
+      await interaction.editReply({ content, embeds: [], components: [] });
+      return;
+    }
+    if (interaction.replied) {
+      await interaction.followUp({ content, ephemeral: true });
+      return;
+    }
+    await interaction.reply({ content, ephemeral: true });
+  } catch {}
+}
+
 client.on("interactionCreate", async (interaction) => {
+  try {
   // ----- SLASH -----
   if (interaction.isChatInputCommand()) {
     if (interaction.commandName !== ROOT_COMMAND_NAME) return;
@@ -2001,12 +2051,13 @@ client.on("interactionCreate", async (interaction) => {
   // ----- BUTTONS -----
   if (interaction.isButton()) {
     if (interaction.customId === "rate_start") {
+      await interaction.deferReply({ ephemeral: true });
       const res = await upsertPersonFromUser(client, interaction.user, { source: "self-start" });
       const session = ensureStage2Session(interaction.user.id);
-      await refreshGraphicTierlist(client).catch(() => false);
-      await interaction.reply(buildRatingCardPayload(interaction.user.id, session, {
+      await interaction.editReply(buildRatingCardPayload(interaction.user.id, session, {
         headerText: buildStartRatingText(res.created),
       }));
+      void scheduleGraphicTierlistRefresh(client);
       return;
     }
 
@@ -2016,13 +2067,14 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.customId.startsWith("rate_vote:")) {
+      await interaction.deferUpdate();
       const [, sessionId = "", value = ""] = String(interaction.customId).split(":");
       const result = applyVoteFromSession(interaction.user.id, sessionId, value);
 
       if (!result.ok) {
         if (result.reason === "stale-session") {
           const fresh = result.session || ensureStage2Session(interaction.user.id, { forceNew: true });
-          await interaction.update(buildRatingCardPayload(interaction.user.id, fresh, {
+          await interaction.editReply(buildRatingCardPayload(interaction.user.id, fresh, {
             headerText: "Старая карточка устарела. Ниже уже свежая.",
           }));
           return;
@@ -2030,21 +2082,21 @@ client.on("interactionCreate", async (interaction) => {
 
         if (result.reason === "no-target" || result.reason === "self-target") {
           const session = result.session || ensureStage2Session(interaction.user.id);
-          await interaction.update(buildRatingCardPayload(interaction.user.id, session, {
+          await interaction.editReply(buildRatingCardPayload(interaction.user.id, session, {
             headerText: "Текущая цель пропала или стала невалидной. Беру следующую.",
           }));
           return;
         }
 
-        await interaction.reply({ content: "Не удалось сохранить голос.", ephemeral: true });
+        await interaction.followUp({ content: "Не удалось сохранить голос.", ephemeral: true });
         return;
       }
 
-      await refreshGraphicTierlist(client).catch(() => false);
-      await interaction.update(buildRatingCardPayload(interaction.user.id, result.session, {
+      await interaction.editReply(buildRatingCardPayload(interaction.user.id, result.session, {
         headerText: "Голос сохранён.",
         lastActionText: `Последний выбор: **${result.written.vote.value === "unknown" ? "Не знаю" : result.written.vote.value}** для **${db.people?.[result.targetId]?.username || db.people?.[result.targetId]?.name || result.targetId}**.`,
       }));
+      void scheduleGraphicTierlistRefresh(client);
       return;
     }
 
@@ -2306,6 +2358,19 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
   }
+  
+  } catch (err) {
+    console.error("interactionCreate failed:", err?.stack || err);
+    await replyInteractionError(interaction, err);
+  }
+});
+
+process.on("unhandledRejection", (err) => {
+  console.error("unhandledRejection:", err?.stack || err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("uncaughtException:", err?.stack || err);
 });
 
 // ====== BOOT ======
