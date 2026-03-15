@@ -114,19 +114,20 @@ const STAGE_PLAN = {
 // ====== DB ======
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    return { config: {}, people: {}, votes: {}, sessions: {}, meta: {}, legacy: {} };
+    return { config: {}, people: {}, votes: {}, comments: {}, sessions: {}, meta: {}, legacy: {} };
   }
   try {
     const data = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
     data.config ||= {};
     data.people ||= {};
     data.votes ||= {};
+    data.comments ||= {};
     data.sessions ||= {};
     data.meta ||= {};
     data.legacy ||= {};
     return data;
   } catch {
-    return { config: {}, people: {}, votes: {}, sessions: {}, meta: {}, legacy: {} };
+    return { config: {}, people: {}, votes: {}, comments: {}, sessions: {}, meta: {}, legacy: {} };
   }
 }
 
@@ -159,12 +160,32 @@ function applyDbDefaults() {
   db.config.rowLabels ||= { ...DEFAULT_ROW_LABELS };
   db.config.rowColors ||= { ...DEFAULT_ROW_COLORS };
   db.config.rowIconScales ||= { ...DEFAULT_ROW_ICON_SCALES };
+  db.config.coefficients ||= {
+    globalRowWeights: { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1 },
+    evaluatorWeights: {},
+    targetBiases: {},
+    rowInfluenceWeights: { "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 },
+  };
+  db.comments ||= {};
 
   for (const rowId of BOARD_ROW_ORDER) {
     if (!db.config.rowLabels[rowId]) db.config.rowLabels[rowId] = DEFAULT_ROW_LABELS[rowId];
     if (!db.config.rowColors[rowId]) db.config.rowColors[rowId] = DEFAULT_ROW_COLORS[rowId];
     if (!db.config.rowIconScales[rowId]) db.config.rowIconScales[rowId] = DEFAULT_ROW_ICON_SCALES[rowId];
   }
+
+  for (const key of ["5", "4", "3", "2", "1", "unknown"]) {
+    const raw = Number(db.config.coefficients.globalRowWeights?.[key]);
+    db.config.coefficients.globalRowWeights[key] = Number.isFinite(raw) && raw > 0 ? raw : 1;
+  }
+  for (const key of ["5", "4", "3", "2", "1", "unknown", "new"]) {
+    const fallback = ({ "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 })[key] || 1;
+    const raw = Number(db.config.coefficients.rowInfluenceWeights?.[key]);
+    db.config.coefficients.rowInfluenceWeights[key] = Number.isFinite(raw) && raw > 0 ? raw : fallback;
+  }
+  db.config.coefficients.evaluatorWeights ||= {};
+  db.config.coefficients.targetBiases ||= {};
+  db.config.coefficients.rowInfluenceWeights ||= { "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 };
 
   db.config.graphicTierlist ||= {
     title: GRAPHIC_TIERLIST_TITLE,
@@ -499,8 +520,115 @@ function resetAllRowColors() {
   db.config.rowColors = { ...DEFAULT_ROW_COLORS };
 }
 
-function countVotesGivenBy(userId) {
-  const map = db.votes?.[userId] || {};
+function clampNumber(value, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return min;
+  return Math.max(min, Math.min(max, n));
+}
+
+function getCoefficientConfig() {
+  applyDbDefaults();
+  return db.config.coefficients;
+}
+
+function getGlobalRowWeight(value) {
+  const key = normalizeVoteValue(value) || "unknown";
+  const raw = Number(getCoefficientConfig().globalRowWeights?.[key]);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+}
+
+function setGlobalRowWeight(value, weight) {
+  const key = normalizeVoteValue(value);
+  const numeric = Number(weight);
+  if (!key || !Number.isFinite(numeric) || numeric <= 0) return false;
+  getCoefficientConfig().globalRowWeights[key] = numeric;
+  return true;
+}
+
+function getEvaluatorWeight(userId) {
+  const raw = Number(getCoefficientConfig().evaluatorWeights?.[userId]);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1;
+}
+
+function setEvaluatorWeight(userId, weight) {
+  const numeric = Number(weight);
+  if (!userId || !Number.isFinite(numeric) || numeric <= 0) return false;
+  getCoefficientConfig().evaluatorWeights[userId] = numeric;
+  return true;
+}
+
+function getTargetBias(userId) {
+  const raw = Number(getCoefficientConfig().targetBiases?.[userId]);
+  return Number.isFinite(raw) ? raw : 0;
+}
+
+function setTargetBias(userId, bias) {
+  const numeric = Number(bias);
+  if (!userId || !Number.isFinite(numeric)) return false;
+  getCoefficientConfig().targetBiases[userId] = numeric;
+  return true;
+}
+
+function clearPersonCoefficients(userId) {
+  if (!userId) return;
+  delete getCoefficientConfig().evaluatorWeights?.[userId];
+  delete getCoefficientConfig().targetBiases?.[userId];
+}
+
+function getRowInfluenceWeight(rowId) {
+  const key = canonicalRowId(rowId) || "new";
+  const raw = Number(getCoefficientConfig().rowInfluenceWeights?.[key]);
+  const fallback = ({ "5": 1.4, "4": 1.475, "3": 1.55, "2": 1.625, "1": 1.7, unknown: 1.55, new: 1.55 })[key] || 1;
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}
+
+function setRowInfluenceWeight(rowId, weight) {
+  const key = canonicalRowId(rowId);
+  const numeric = Number(weight);
+  if (!key || !Number.isFinite(numeric) || numeric <= 0) return false;
+  getCoefficientConfig().rowInfluenceWeights[key] = numeric;
+  return true;
+}
+
+function getEvaluatorBoardRowId(userId) {
+  const person = db.people?.[userId];
+  return person ? getBoardRowForPerson(person) : "new";
+}
+
+function getEvaluatorRowInfluence(userId) {
+  return getRowInfluenceWeight(getEvaluatorBoardRowId(userId));
+}
+
+function getSessionDraftVoteMap(userId) {
+  const map = db.sessions?.[userId]?.draftVotes;
+  return map && typeof map === "object" ? map : {};
+}
+
+function getSessionDraftCommentMap(userId) {
+  const map = db.sessions?.[userId]?.draftComments;
+  return map && typeof map === "object" ? map : {};
+}
+
+function buildPersonalVoteMap(userId, options = {}) {
+  const includeDraft = options.includeDraft !== false;
+  const out = { ...(db.votes?.[userId] || {}) };
+  if (includeDraft) {
+    for (const [targetId, vote] of Object.entries(getSessionDraftVoteMap(userId))) out[targetId] = vote;
+  }
+  return out;
+}
+
+function getStoredComment(evaluatorId, targetId, options = {}) {
+  const includeDraft = options.includeDraft !== false;
+  if (includeDraft) {
+    const draft = getSessionDraftCommentMap(evaluatorId)?.[targetId];
+    if (draft && typeof draft.text === "string") return draft;
+  }
+  return db.comments?.[evaluatorId]?.[targetId] || null;
+}
+
+function countVotesGivenBy(userId, options = {}) {
+  const map = buildPersonalVoteMap(userId, { includeDraft: options.includeDraft !== false });
   let total = 0;
   let known = 0;
   let unknown = 0;
@@ -519,65 +647,201 @@ function countVotesReceivedBy(targetId) {
   let known = 0;
   let unknown = 0;
   let sumKnown = 0;
+  let weightedKnownSum = 0;
+  let weightedKnownWeight = 0;
+  let weightedUnknown = 0;
   let lastVoteAt = "";
   const byValue = { "5": 0, "4": 0, "3": 0, "2": 0, "1": 0, unknown: 0 };
 
-  for (const voterMap of Object.values(db.votes || {})) {
+  for (const [evaluatorId, voterMap] of Object.entries(db.votes || {})) {
     const vote = voterMap?.[targetId];
     const value = normalizeVoteValue(vote?.value);
     if (!value) continue;
+
+    const evaluatorWeight = getEvaluatorWeight(evaluatorId);
+    const evaluatorRowInfluence = getEvaluatorRowInfluence(evaluatorId);
+    const rowWeight = getGlobalRowWeight(value);
+    const effectiveWeight = evaluatorWeight * evaluatorRowInfluence * rowWeight;
 
     total++;
     if (String(vote?.updatedAt || "") > lastVoteAt) lastVoteAt = String(vote.updatedAt || "");
     if (value === "unknown") {
       unknown++;
       byValue.unknown++;
+      weightedUnknown += effectiveWeight;
     } else {
       known++;
-      sumKnown += Number(value) || 0;
+      const numeric = Number(value) || 0;
+      sumKnown += numeric;
+      weightedKnownSum += numeric * effectiveWeight;
+      weightedKnownWeight += effectiveWeight;
       byValue[value] = (byValue[value] || 0) + 1;
     }
   }
 
-  const average = known ? sumKnown / known : null;
+  const baseAverage = weightedKnownWeight ? weightedKnownSum / weightedKnownWeight : null;
+  const bias = getTargetBias(targetId);
+  const average = baseAverage == null ? null : clampNumber(baseAverage + bias, 1, 5);
+  const unknownWeightTotal = weightedUnknown + weightedKnownWeight;
   return {
     total,
     known,
     unknown,
     sumKnown,
     average,
+    baseAverage,
     roundedAverage: average == null ? null : Math.max(1, Math.min(5, Math.round(average))),
-    unknownShare: total ? unknown / total : 0,
+    unknownShare: unknownWeightTotal ? weightedUnknown / unknownWeightTotal : 0,
     lastVoteAt,
     byValue,
+    weightedKnownWeight,
+    weightedUnknown,
+    targetBias: bias,
   };
 }
 
 function choosePreviewRowIdFromAggregate(agg) {
   if (!agg || !agg.total) return "new";
-  if (!agg.known && agg.unknown) return "unknown";
-  if (!agg.known) return "unknown";
-
-  const unknownIsDominant = agg.unknown >= Math.max(3, agg.known + 1);
-  const unknownShareIsHigh = agg.total >= 4 && agg.unknownShare >= 0.6 && agg.unknown >= agg.known;
-  if (unknownIsDominant || unknownShareIsHigh) return "unknown";
-
+  if (!agg.known) return "new";
   return String(Math.max(1, Math.min(5, Math.round(agg.average || 3))));
+}
+
+function getTierThresholds(rowId) {
+  const id = canonicalRowId(rowId);
+  if (!NUMERIC_ROW_IDS.has(id)) return null;
+  const tier = Number(id);
+  return {
+    rowId: id,
+    promotionThreshold: tier < 5 ? tier + 0.5 : null,
+    demotionThreshold: tier > 1 ? tier - 0.5 : null,
+  };
+}
+
+function buildPromotionDemotionMeta(rowId, average) {
+  const thresholds = getTierThresholds(rowId);
+  const avg = Number(average);
+  if (!thresholds || !Number.isFinite(avg)) {
+    return {
+      promotionThreshold: thresholds?.promotionThreshold ?? null,
+      demotionThreshold: thresholds?.demotionThreshold ?? null,
+      distanceToPromotion: null,
+      distanceToDemotion: null,
+      promotionReadyScore: null,
+      demotionRiskScore: null,
+      withinTierProgress: null,
+      edgeState: "none",
+    };
+  }
+
+  const promotionThreshold = thresholds.promotionThreshold;
+  const demotionThreshold = thresholds.demotionThreshold;
+  const distanceToPromotion = promotionThreshold == null ? null : Math.max(0, promotionThreshold - avg);
+  const distanceToDemotion = demotionThreshold == null ? null : Math.max(0, avg - demotionThreshold);
+
+  let withinTierProgress = null;
+  if (promotionThreshold != null && demotionThreshold != null) {
+    withinTierProgress = clampNumber((avg - demotionThreshold) / (promotionThreshold - demotionThreshold), 0, 1);
+  } else if (promotionThreshold != null) {
+    withinTierProgress = clampNumber(1 - (promotionThreshold - avg), 0, 1);
+  } else if (demotionThreshold != null) {
+    withinTierProgress = clampNumber(avg - demotionThreshold, 0, 1);
+  }
+
+  let edgeState = "stable";
+  if (promotionThreshold == null && demotionThreshold != null) {
+    edgeState = distanceToDemotion <= 0.12 ? "danger-demotion" : "safe-top";
+  } else if (promotionThreshold != null && demotionThreshold == null) {
+    edgeState = distanceToPromotion <= 0.12 ? "ready-promotion" : "climbing";
+  } else if (distanceToPromotion != null && distanceToDemotion != null) {
+    if (distanceToPromotion < distanceToDemotion) edgeState = "closer-promotion";
+    else if (distanceToDemotion < distanceToPromotion) edgeState = "closer-demotion";
+  }
+
+  return {
+    promotionThreshold,
+    demotionThreshold,
+    distanceToPromotion,
+    distanceToDemotion,
+    promotionReadyScore: distanceToPromotion == null ? null : 1 / (distanceToPromotion + 0.001),
+    demotionRiskScore: distanceToDemotion == null ? null : 1 / (distanceToDemotion + 0.001),
+    withinTierProgress,
+    edgeState,
+  };
+}
+
+function formatPromotionDemotionLine(aggregate) {
+  const rowId = canonicalRowId(aggregate?.rowId);
+  if (!NUMERIC_ROW_IDS.has(rowId) || !Number.isFinite(Number(aggregate?.average))) return "Дистанция до апа/дауна: —";
+
+  const parts = [];
+  if (aggregate.distanceToPromotion != null && aggregate.promotionThreshold != null) {
+    parts.push(`до повышения ${aggregate.promotionThreshold.toFixed(1)}: ${aggregate.distanceToPromotion.toFixed(2)}`);
+  }
+  if (aggregate.distanceToDemotion != null && aggregate.demotionThreshold != null) {
+    parts.push(`до понижения ${aggregate.demotionThreshold.toFixed(1)}: ${aggregate.distanceToDemotion.toFixed(2)}`);
+  }
+  return parts.length ? parts.join(" | ") : "Дистанция до апа/дауна: —";
+}
+
+function comparePromotionDemotionPriority(aAgg, bAgg, rowId) {
+  const id = canonicalRowId(rowId);
+  const aAverage = Number(aAgg?.average) || 0;
+  const bAverage = Number(bAgg?.average) || 0;
+  const aKnown = Number(aAgg?.knownCount) || 0;
+  const bKnown = Number(bAgg?.knownCount) || 0;
+  const aPromo = Number.isFinite(Number(aAgg?.distanceToPromotion)) ? Number(aAgg.distanceToPromotion) : Number.POSITIVE_INFINITY;
+  const bPromo = Number.isFinite(Number(bAgg?.distanceToPromotion)) ? Number(bAgg.distanceToPromotion) : Number.POSITIVE_INFINITY;
+  const aDemo = Number.isFinite(Number(aAgg?.distanceToDemotion)) ? Number(aAgg.distanceToDemotion) : Number.NEGATIVE_INFINITY;
+  const bDemo = Number.isFinite(Number(bAgg?.distanceToDemotion)) ? Number(bAgg.distanceToDemotion) : Number.NEGATIVE_INFINITY;
+
+  if (id === "5") {
+    if (bDemo !== aDemo) return bDemo - aDemo;
+    if (bAverage !== aAverage) return bAverage - aAverage;
+    if (bKnown !== aKnown) return bKnown - aKnown;
+    return 0;
+  }
+
+  if (id === "1") {
+    if (aPromo !== bPromo) return aPromo - bPromo;
+    if (bAverage !== aAverage) return bAverage - aAverage;
+    if (bKnown !== aKnown) return bKnown - aKnown;
+    return 0;
+  }
+
+  if (aPromo !== bPromo) return aPromo - bPromo;
+  if (bDemo !== aDemo) return bDemo - aDemo;
+  if (bAverage !== aAverage) return bAverage - aAverage;
+  if (bKnown !== aKnown) return bKnown - aKnown;
+  return 0;
 }
 
 function buildAggregateForTarget(targetId) {
   const received = countVotesReceivedBy(targetId);
+  const rowId = choosePreviewRowIdFromAggregate(received);
+  const distanceMeta = buildPromotionDemotionMeta(rowId, received.average);
   return {
     total: received.total,
     knownCount: received.known,
     unknownCount: received.unknown,
     sumKnown: received.sumKnown,
     average: received.average,
+    baseAverage: received.baseAverage,
     roundedAverage: received.roundedAverage,
     unknownShare: received.unknownShare,
     distribution: received.byValue,
-    rowId: choosePreviewRowIdFromAggregate(received),
+    rowId,
     lastVoteAt: received.lastVoteAt,
+    weightedKnownWeight: received.weightedKnownWeight,
+    weightedUnknown: received.weightedUnknown,
+    targetBias: received.targetBias,
+    promotionThreshold: distanceMeta.promotionThreshold,
+    demotionThreshold: distanceMeta.demotionThreshold,
+    distanceToPromotion: distanceMeta.distanceToPromotion,
+    distanceToDemotion: distanceMeta.distanceToDemotion,
+    promotionReadyScore: distanceMeta.promotionReadyScore,
+    demotionRiskScore: distanceMeta.demotionRiskScore,
+    withinTierProgress: distanceMeta.withinTierProgress,
+    edgeState: distanceMeta.edgeState,
   };
 }
 
@@ -588,8 +852,8 @@ function refreshAllPeopleDerivedState(save = false) {
     if (!person || !userId) continue;
 
     const agg = buildAggregateForTarget(userId);
-    const fallbackRow = canonicalRowId(person.previewRowId || person.stage1PinnedRowId || person.legacy?.tier || "new") || "new";
-    const nextPreviewRow = agg.total > 0 ? agg.rowId : fallbackRow;
+    const fallbackRow = canonicalRowId(person.stage1PinnedRowId || person.previewRowId || person.legacy?.tier || "new") || "new";
+    const nextPreviewRow = agg.total > 0 ? (agg.knownCount > 0 ? agg.rowId : fallbackRow) : fallbackRow;
     const prevAgg = JSON.stringify(person.stage2Aggregate || {});
     const nextAgg = JSON.stringify(agg);
 
@@ -620,10 +884,7 @@ function getBoardRowForPerson(person) {
 }
 
 function formatBadgeForPerson(person) {
-  const rowId = getBoardRowForPerson(person);
-  if (NUMERIC_ROW_IDS.has(rowId)) return rowId;
-  if (rowId === "unknown") return "?";
-  return "NEW";
+  return "";
 }
 
 function sortPeopleForRow(list, rowId) {
@@ -636,8 +897,8 @@ function sortPeopleForRow(list, rowId) {
       if ((bv.unknownShare || 0) !== (av.unknownShare || 0)) return (bv.unknownShare || 0) - (av.unknownShare || 0);
       if ((bv.unknownCount || 0) !== (av.unknownCount || 0)) return (bv.unknownCount || 0) - (av.unknownCount || 0);
     } else if (NUMERIC_ROW_IDS.has(id)) {
-      if ((bv.average || 0) !== (av.average || 0)) return (bv.average || 0) - (av.average || 0);
-      if ((bv.knownCount || 0) !== (av.knownCount || 0)) return (bv.knownCount || 0) - (av.knownCount || 0);
+      const promotionDemotionCmp = comparePromotionDemotionPriority(av, bv, id);
+      if (promotionDemotionCmp) return promotionDemotionCmp;
     } else {
       const aCreated = String(a.createdAt || "");
       const bCreated = String(b.createdAt || "");
@@ -653,15 +914,13 @@ function buildGraphicBucketsFromPeople() {
   for (const person of Object.values(db.people || {})) {
     if (!person?.userId) continue;
     const aggregate = person.stage2Aggregate || buildAggregateForTarget(person.userId);
-    const rowId = getBoardRowForPerson(person);
-    if (!buckets[rowId]) continue;
-    buckets[rowId].push({
+    const primaryRowId = getBoardRowForPerson(person);
+    const baseCard = {
       userId: person.userId,
       name: person.name || person.userId,
       username: String(person.username || "").trim() || person.name || person.userId,
       avatarUrl: normalizeDiscordAvatarUrl(person.avatarUrl || ""),
-      badgeText: formatBadgeForPerson(person),
-      rowId,
+      badgeText: "",
       aggregate,
       received: {
         total: aggregate.total,
@@ -670,7 +929,11 @@ function buildGraphicBucketsFromPeople() {
       },
       createdAt: person.createdAt || "",
       source: person.source || "manual",
-    });
+    };
+    if (buckets[primaryRowId]) buckets[primaryRowId].push({ ...baseCard, rowId: primaryRowId });
+    if ((aggregate.unknownCount || 0) > 0) {
+      buckets.unknown.push({ ...baseCard, rowId: "unknown", duplicateOf: primaryRowId });
+    }
   }
 
   for (const rowId of BOARD_ROW_ORDER) sortPeopleForRow(buckets[rowId], rowId);
@@ -744,17 +1007,93 @@ function removePersonAndVotes(userId) {
     if (db.votes[voterId] && db.votes[voterId][userId]) delete db.votes[voterId][userId];
     if (voterId === userId) delete db.votes[voterId];
   }
+  for (const voterId of Object.keys(db.comments || {})) {
+    if (db.comments[voterId] && db.comments[voterId][userId]) delete db.comments[voterId][userId];
+    if (voterId === userId) delete db.comments[voterId];
+  }
 
   if (db.sessions?.[userId]) delete db.sessions[userId];
   for (const session of Object.values(db.sessions || {})) {
-    if (!session || session.activeTargetId !== userId) continue;
-    session.activeTargetId = "";
+    if (!session) continue;
+    if (session.activeTargetId === userId) session.activeTargetId = "";
+    if (session.draftVotes?.[userId]) delete session.draftVotes[userId];
+    if (session.draftComments?.[userId]) delete session.draftComments[userId];
     session.updatedAt = nowIso();
   }
 
+  clearPersonCoefficients(userId);
   refreshAllPeopleDerivedState();
   saveDB(db);
   return true;
+}
+
+function resetEvaluatorProgress(userId) {
+  if (!userId) return { clearedVotes: 0, clearedComments: 0 };
+  const clearedVotes = Object.keys(db.votes?.[userId] || {}).length;
+  const clearedComments = Object.keys(db.comments?.[userId] || {}).length;
+  if (db.votes?.[userId]) delete db.votes[userId];
+  if (db.comments?.[userId]) delete db.comments[userId];
+  if (db.sessions?.[userId]) delete db.sessions[userId];
+  refreshAllPeopleDerivedState();
+  saveDB(db);
+  return { clearedVotes, clearedComments };
+}
+
+function listCommittedVotes(filters = {}) {
+  const rows = [];
+  const limit = Math.max(1, Math.min(100, Number(filters.limit) || 25));
+  for (const [evaluatorId, voterMap] of Object.entries(db.votes || {})) {
+    for (const [targetId, vote] of Object.entries(voterMap || {})) {
+      const value = normalizeVoteValue(vote?.value);
+      if (!value) continue;
+      if (filters.evaluatorId && evaluatorId !== filters.evaluatorId) continue;
+      if (filters.targetId && targetId !== filters.targetId) continue;
+      const evaluator = db.people?.[evaluatorId];
+      const target = db.people?.[targetId];
+      const comment = db.comments?.[evaluatorId]?.[targetId]?.text || "";
+      rows.push({
+        evaluatorId,
+        evaluatorLabel: evaluator?.username || evaluator?.name || evaluatorId,
+        targetId,
+        targetLabel: target?.username || target?.name || targetId,
+        value,
+        updatedAt: String(vote?.updatedAt || vote?.createdAt || ""),
+        comment,
+        evaluatorWeight: getEvaluatorWeight(evaluatorId),
+        rowInfluence: getEvaluatorRowInfluence(evaluatorId),
+      });
+    }
+  }
+  rows.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(a.evaluatorLabel).localeCompare(String(b.evaluatorLabel), "ru"));
+  return rows.slice(0, limit);
+}
+
+function formatVoteAuditLines(filters = {}) {
+  const rows = listCommittedVotes(filters);
+  if (!rows.length) return ["Совпадений не найдено."];
+  return rows.map((row, i) => {
+    const commentPart = row.comment ? ` | комм: ${row.comment.slice(0, 80)}` : "";
+    return `${i + 1}. ${row.evaluatorLabel} -> ${row.targetLabel} = ${row.value === "unknown" ? "Не знаю" : row.value} | eval x${row.evaluatorWeight.toFixed(2)} | row x${row.rowInfluence.toFixed(2)}${commentPart}`;
+  });
+}
+
+function buildDetailedGivenLines(userId, max = 12) {
+  const map = buildPersonalVoteMap(userId, { includeDraft: true });
+  const rows = [];
+  for (const [targetId, vote] of Object.entries(map)) {
+    const value = normalizeVoteValue(vote?.value);
+    if (!value) continue;
+    const person = db.people?.[targetId];
+    const comment = getStoredComment(userId, targetId, { includeDraft: true })?.text || "";
+    rows.push({
+      label: person?.username || person?.name || targetId,
+      value,
+      updatedAt: String(vote?.updatedAt || vote?.createdAt || ""),
+      comment,
+    });
+  }
+  rows.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(a.label).localeCompare(String(b.label), "ru"));
+  return rows.slice(0, max).map((row) => `• ${row.label} → ${row.value === "unknown" ? "Не знаю" : row.value}${row.comment ? ` | комм: ${row.comment.slice(0, 70)}` : ""}`);
 }
 
 async function importRoleMembers(client, role) {
@@ -783,11 +1122,17 @@ function getEligibleTargetIdsForEvaluator(userId) {
 }
 
 function getPendingTargetIdsForEvaluator(userId) {
-  const givenMap = db.votes?.[userId] || {};
+  const givenMap = buildPersonalVoteMap(userId, { includeDraft: true });
   return getEligibleTargetIdsForEvaluator(userId).filter((targetId) => !normalizeVoteValue(givenMap?.[targetId]?.value));
 }
 
-function getCurrentVote(evaluatorId, targetId) {
+function getCurrentVote(evaluatorId, targetId, options = {}) {
+  const includeDraft = options.includeDraft !== false;
+  if (includeDraft) {
+    const draft = getSessionDraftVoteMap(evaluatorId)?.[targetId];
+    const draftValue = normalizeVoteValue(draft?.value);
+    if (draftValue) return draft;
+  }
   const value = normalizeVoteValue(db.votes?.[evaluatorId]?.[targetId]?.value);
   return value ? db.votes[evaluatorId][targetId] : null;
 }
@@ -828,6 +1173,8 @@ function ensureStage2Session(userId, options = {}) {
       lastVoteValue: "",
       votesCastThisSession: 0,
       history: [],
+      draftVotes: {},
+      draftComments: {},
       stage: 3,
     };
     db.sessions[userId] = session;
@@ -835,16 +1182,19 @@ function ensureStage2Session(userId, options = {}) {
 
   session.stage = 3;
   session.updatedAt = now;
+  session.history = Array.isArray(session.history) ? session.history : [];
+  session.draftVotes = session.draftVotes && typeof session.draftVotes === "object" ? session.draftVotes : {};
+  session.draftComments = session.draftComments && typeof session.draftComments === "object" ? session.draftComments : {};
 
   const currentTargetId = String(session.activeTargetId || "");
-  const currentStillValid = currentTargetId && currentTargetId !== userId && !getCurrentVote(userId, currentTargetId) && db.people?.[currentTargetId];
+  const currentStillValid = currentTargetId && currentTargetId !== userId && !getCurrentVote(userId, currentTargetId, { includeDraft: true }) && db.people?.[currentTargetId];
   if (!currentStillValid) session.activeTargetId = pickNextTargetForEvaluator(userId);
 
   saveDB(db);
   return session;
 }
 
-function setVoteForTarget(evaluatorId, targetId, value, meta = {}) {
+function setCommittedVoteForTarget(evaluatorId, targetId, value, meta = {}) {
   const normalized = normalizeVoteValue(value);
   if (!normalized) throw new Error("bad vote value");
   if (!evaluatorId || !targetId) throw new Error("evaluatorId/targetId required");
@@ -862,16 +1212,53 @@ function setVoteForTarget(evaluatorId, targetId, value, meta = {}) {
     numericValue: voteValueToNumber(normalized),
     createdAt: previous?.createdAt || now,
     updatedAt: now,
-    via: meta.via || previous?.via || "stage2",
+    via: meta.via || previous?.via || "stage3-personal-commit",
     sessionId: meta.sessionId || previous?.sessionId || "",
   };
 
   if (db.people[targetId]) db.people[targetId].updatedAt = now;
   if (db.people[evaluatorId]) db.people[evaluatorId].updatedAt = now;
 
+  return { previous, vote: db.votes[evaluatorId][targetId] };
+}
+
+function commitSessionDrafts(userId, session) {
+  session = session || db.sessions?.[userId];
+  if (!session) return { committedVotes: 0, committedComments: 0 };
+
+  let committedVotes = 0;
+  let committedComments = 0;
+  for (const [targetId, vote] of Object.entries(session.draftVotes || {})) {
+    const normalized = normalizeVoteValue(vote?.value);
+    if (!normalized || !db.people?.[targetId] || targetId === userId) continue;
+    setCommittedVoteForTarget(userId, targetId, normalized, { via: vote?.via || "stage3-personal-commit", sessionId: session.sessionId });
+    committedVotes++;
+  }
+
+  db.comments ||= {};
+  db.comments[userId] ||= {};
+  for (const [targetId, comment] of Object.entries(session.draftComments || {})) {
+    const text = String(comment?.text || "").trim().slice(0, 1000);
+    if (!targetId || !db.people?.[targetId] || targetId === userId) continue;
+    if (!text) continue;
+    const previous = db.comments[userId][targetId] || null;
+    db.comments[userId][targetId] = {
+      evaluatorId: userId,
+      targetId,
+      text,
+      createdAt: previous?.createdAt || nowIso(),
+      updatedAt: nowIso(),
+      sessionId: session.sessionId,
+    };
+    committedComments++;
+  }
+
+  session.draftVotes = {};
+  session.draftComments = {};
+  session.lastCommittedAt = nowIso();
   refreshAllPeopleDerivedState();
   saveDB(db);
-  return { previous, vote: db.votes[evaluatorId][targetId] };
+  return { committedVotes, committedComments };
 }
 
 function applyVoteFromSession(userId, sessionId, value) {
@@ -895,24 +1282,74 @@ function applyVoteFromSession(userId, sessionId, value) {
     return { ok: false, reason: "self-target", session };
   }
 
-  const written = setVoteForTarget(userId, targetId, value, { via: "stage2-card", sessionId });
+  const normalized = normalizeVoteValue(value);
+  const now = nowIso();
+  session.draftVotes ||= {};
+  const previous = session.draftVotes[targetId] || null;
+  session.draftVotes[targetId] = {
+    evaluatorId: userId,
+    targetId,
+    value: normalized,
+    numericValue: voteValueToNumber(normalized),
+    createdAt: previous?.createdAt || now,
+    updatedAt: now,
+    via: "stage3-personal-draft",
+    sessionId,
+  };
+
   session.lastCompletedTargetId = targetId;
-  session.lastVoteValue = normalizeVoteValue(value);
+  session.lastVoteValue = normalized;
   session.votesCastThisSession = Number(session.votesCastThisSession || 0) + 1;
-  session.updatedAt = nowIso();
+  session.updatedAt = now;
   session.history = Array.isArray(session.history) ? session.history : [];
   session.history.unshift({
     targetId,
-    value: normalizeVoteValue(value),
+    value: normalized,
     at: session.updatedAt,
   });
   session.history = session.history.slice(0, db.config.sessionHistoryLimit || SESSION_HISTORY_LIMIT);
   session.activeTargetId = pickNextTargetForEvaluator(userId);
-  if (!session.activeTargetId) session.completedAt = session.updatedAt;
-  else delete session.completedAt;
-  saveDB(db);
 
-  return { ok: true, targetId, session, written };
+  let committed = null;
+  if (!session.activeTargetId) {
+    session.completedAt = session.updatedAt;
+    committed = commitSessionDrafts(userId, session);
+  } else {
+    delete session.completedAt;
+    saveDB(db);
+  }
+
+  return { ok: true, targetId, session, written: { previous, vote: session.draftVotes?.[targetId] || { value: normalized } }, committed };
+}
+
+function applyCommentFromSession(userId, sessionId, targetId, text) {
+  const session = ensureStage2Session(userId);
+  if (!session || session.sessionId !== sessionId) {
+    return { ok: false, reason: "stale-session", session: ensureStage2Session(userId, { forceNew: true }) };
+  }
+
+  const cleanTargetId = String(targetId || session.activeTargetId || "");
+  if (!cleanTargetId || !db.people?.[cleanTargetId] || cleanTargetId === userId) {
+    return { ok: false, reason: "bad-target", session };
+  }
+
+  const cleanText = String(text || "").trim().slice(0, 1000);
+  session.draftComments ||= {};
+  if (!cleanText) delete session.draftComments[cleanTargetId];
+  else {
+    const previous = session.draftComments[cleanTargetId] || db.comments?.[userId]?.[cleanTargetId] || null;
+    session.draftComments[cleanTargetId] = {
+      evaluatorId: userId,
+      targetId: cleanTargetId,
+      text: cleanText,
+      createdAt: previous?.createdAt || nowIso(),
+      updatedAt: nowIso(),
+      sessionId,
+    };
+  }
+  session.updatedAt = nowIso();
+  saveDB(db);
+  return { ok: true, session, targetId: cleanTargetId, comment: session.draftComments[cleanTargetId] || null };
 }
 
 function formatAverage(average) {
@@ -926,8 +1363,8 @@ function listNamesForField(items, max = 8) {
   return rest > 0 ? `${sliced.join(", ")} +${rest}` : sliced.join(", ");
 }
 
-function buildPersonalTierFields(userId) {
-  const map = db.votes?.[userId] || {};
+function buildPersonalTierFields(userId, options = {}) {
+  const map = buildPersonalVoteMap(userId, { includeDraft: options.includeDraft !== false });
   const grouped = Object.fromEntries(PERSONAL_TIER_ORDER.map((id) => [id, []]));
 
   for (const [targetId, rawVote] of Object.entries(map)) {
@@ -964,9 +1401,164 @@ function buildSessionHistoryLines(userId, max = 6) {
   });
 }
 
-function buildMyStatusPayload(userId) {
+function getAnonymousCommentsForTarget(targetId, max = 8) {
+  const items = [];
+  for (const evaluatorMap of Object.values(db.comments || {})) {
+    const comment = evaluatorMap?.[targetId];
+    const text = String(comment?.text || "").trim();
+    if (!text) continue;
+    items.push({ text, at: String(comment?.updatedAt || comment?.createdAt || "") });
+  }
+  items.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  return items.slice(0, max);
+}
+
+function buildPersonalBucketsForUser(userId, options = {}) {
+  const map = buildPersonalVoteMap(userId, { includeDraft: options.includeDraft !== false });
+  const buckets = Object.fromEntries(PERSONAL_TIER_ORDER.map((id) => [id, []]));
+  for (const [targetId, rawVote] of Object.entries(map)) {
+    const value = normalizeVoteValue(rawVote?.value);
+    if (!value || !buckets[value]) continue;
+    const person = db.people?.[targetId];
+    buckets[value].push({
+      userId: targetId,
+      name: person?.name || targetId,
+      username: String(person?.username || person?.name || targetId).trim(),
+      avatarUrl: normalizeDiscordAvatarUrl(person?.avatarUrl || ""),
+      badgeText: value === "unknown" ? "?" : value,
+      updatedAt: String(rawVote?.updatedAt || ""),
+      createdAt: person?.createdAt || "",
+      aggregate: person?.stage2Aggregate || buildAggregateForTarget(targetId),
+    });
+  }
+  for (const rowId of PERSONAL_TIER_ORDER) {
+    buckets[rowId].sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(a.username).localeCompare(String(b.username), "ru"));
+  }
+  return buckets;
+}
+
+async function renderPersonalTierlistPng(client, userId, options = {}) {
+  const buckets = buildPersonalBucketsForUser(userId, { includeDraft: options.includeDraft !== false });
+  const total = Object.values(buckets).reduce((sum, list) => sum + list.length, 0);
+  if (!total) return null;
+  if (!PImage) throw new Error("Не найден модуль pureimage. Установи: npm i pureimage");
+  if (!ensureGraphicFonts()) throw new Error(`Не удалось загрузить системный шрифт для PNG. source=${GRAPHIC_FONT_INFO.source || "none"}. ${GRAPHIC_FONT_INFO.loadError || ""}`.trim());
+
+  const { W, H: H_CFG, ICON } = getGraphicImageConfig();
+  const rows = PERSONAL_TIER_ORDER;
+  const topY = 120;
+  const leftW = Math.floor(W * 0.24);
+  const rightPadding = 36;
+  const footerH = 44;
+
+  const rowLayout = rows.map((rowId) => {
+    const list = buckets[rowId] || [];
+    const rowIcon = Math.max(42, Math.floor(ICON * getRowIconScale(rowId)));
+    const gap = Math.max(10, Math.floor(rowIcon * 0.16));
+    const rightW = W - leftW - rightPadding - 24;
+    const cols = Math.max(1, Math.floor((rightW + gap) / (rowIcon + gap)));
+    if (rowId === "unknown") {
+      const bandRows = getUnknownBandRows();
+      const bandCapacity = Math.max(1, cols * bandRows);
+      const groupsNeeded = Math.max(1, Math.ceil(list.length / bandCapacity));
+      const iconsH = Math.max(1, groupsNeeded) * (bandRows * rowIcon + (bandRows - 1) * gap) + Math.max(0, groupsNeeded - 1) * gap;
+      const needed = 18 + iconsH + 22 + 12;
+      const rowH = Math.max(needed, 18 + (bandRows * rowIcon + (bandRows - 1) * gap) + 22 + 12);
+      return { rowId, list, rowIcon, gap, cols, rowH, bandRows, groupsNeeded };
+    }
+    const rowsNeeded = Math.max(1, Math.ceil(list.length / cols));
+    const iconsH = rowsNeeded * (rowIcon + gap) - gap;
+    return { rowId, list, rowIcon, gap, cols, rowH: Math.max(18 + iconsH + 22 + 12, 160), bandRows: 1, groupsNeeded: rowsNeeded };
+  });
+
+  const neededH = topY + rowLayout.reduce((sum, r) => sum + r.rowH, 0) + footerH;
+  const H = Math.max(H_CFG, neededH);
+  const title = options.title || `Личный тир-лист`;
+
+  const img = PImage.make(W, H);
+  const ctx = img.getContext("2d");
+  fillColor(ctx, "#242424");
+  ctx.fillRect(0, 0, W, H);
+  fillColor(ctx, "#ffffff");
+  setGraphicFont(ctx, 64, "bold");
+  ctx.fillText(title, 40, 82);
+  fillColor(ctx, "#cfcfcf");
+  setGraphicFont(ctx, 22, "regular");
+  ctx.fillText(`личных голосов: ${total}. draft включён: ${options.includeDraft !== false ? "yes" : "no"}.`, 40, H - 18);
+
+  let yCursor = topY;
+  for (const row of rowLayout) {
+    const { rowId, list, rowIcon, gap, cols, rowH } = row;
+    const y = yCursor;
+    yCursor += rowH;
+
+    fillColor(ctx, "#2f2f2f");
+    ctx.fillRect(leftW, y, W - leftW - rightPadding, rowH - 12);
+    fillColor(ctx, getRowColor(rowId));
+    ctx.fillRect(40, y, leftW - 40, rowH - 12);
+
+    const blockH = rowH - 12;
+    const labelX = 40 + 56;
+    const labelW = (leftW - 40) - 56 - 18;
+    const bottomLabelY = y + blockH - 18;
+    const titleBoxY = y + 16;
+    const titleBoxH = Math.max(44, bottomLabelY - titleBoxY - 18);
+    drawGraphicTierTitle(ctx, rowId === "unknown" ? "не знаю" : `тир ${rowId}`, labelX, titleBoxY, labelW, titleBoxH);
+    fillColor(ctx, "#111111");
+    setGraphicFont(ctx, 24, "regular");
+    ctx.fillText(rowId === "unknown" ? "UNKNOWN" : `TIER ${rowId}`, labelX, bottomLabelY);
+
+    const rightX = leftW + 24;
+    const rightY = y + 18;
+    for (let idx = 0; idx < list.length; idx++) {
+      const player = list[idx];
+      let x = rightX;
+      let yy = rightY;
+      if (rowId === "unknown") {
+        const bandRows = Math.max(1, row.bandRows || getUnknownBandRows());
+        const bandCapacity = Math.max(1, cols * bandRows);
+        const groupIndex = Math.floor(idx / bandCapacity);
+        const withinGroup = idx % bandCapacity;
+        const col = Math.floor(withinGroup / bandRows);
+        const rowInGroup = withinGroup % bandRows;
+        x = rightX + col * (rowIcon + gap);
+        yy = rightY + groupIndex * (bandRows * rowIcon + bandRows * gap) + rowInGroup * (rowIcon + gap);
+      } else {
+        const col = idx % cols;
+        const rowIndex = Math.floor(idx / cols);
+        x = rightX + col * (rowIcon + gap);
+        yy = rightY + rowIndex * (rowIcon + gap);
+      }
+      const avatar = await loadGraphicAvatarForPlayer(client, player);
+      fillColor(ctx, "#171717");
+      ctx.fillRect(x - 3, yy - 3, rowIcon + 6, rowIcon + 6);
+      if (avatar) ctx.drawImage(avatar, x, yy, rowIcon, rowIcon);
+      else {
+        fillColor(ctx, "#555555");
+        ctx.fillRect(x, yy, rowIcon, rowIcon);
+      }
+      const usernameBarH = Math.max(18, Math.floor(rowIcon * 0.24));
+      ctx.fillStyle = "rgba(0,0,0,0.78)";
+      ctx.fillRect(x, yy + rowIcon - usernameBarH, rowIcon, usernameBarH);
+      const usernameFit = fitGraphicSingleLineText(ctx, String(player.username || player.name || player.userId || "").trim(), "bold", Math.max(10, rowIcon - 10), Math.max(10, Math.floor(rowIcon * 0.18)), 9);
+      setGraphicFont(ctx, usernameFit.px, "bold");
+      ctx.fillStyle = "rgba(255,255,255,0.98)";
+      const usernameY = yy + rowIcon - Math.max(5, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
+      ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
+    }
+  }
+
+  const chunks = [];
+  const stream = new PassThrough();
+  stream.on("data", (c) => chunks.push(c));
+  await PImage.encodePNGToStream(img, stream);
+  stream.end();
+  return Buffer.concat(chunks);
+}
+
+async function buildMyStatusPayload(client, userId) {
   const person = db.people?.[userId] || null;
-  const given = countVotesGivenBy(userId);
+  const given = countVotesGivenBy(userId, { includeDraft: true });
   const received = person?.stage2Aggregate || buildAggregateForTarget(userId);
   const rowId = person ? getBoardRowForPerson(person) : "";
   const eligible = Math.max(0, getEligibleTargetIdsForEvaluator(userId).length);
@@ -975,43 +1567,65 @@ function buildMyStatusPayload(userId) {
   const session = db.sessions?.[userId] || null;
   const activeTarget = session?.activeTargetId ? db.people?.[session.activeTargetId] : null;
   const lastTarget = session?.lastCompletedTargetId ? db.people?.[session.lastCompletedTargetId] : null;
-  const historyLines = buildSessionHistoryLines(userId);
+  const historyLines = buildSessionHistoryLines(userId, 8);
+  const anonymousComments = getAnonymousCommentsForTarget(userId, 8);
+  const detailedGiven = buildDetailedGivenLines(userId, 12);
+
   const summary = new EmbedBuilder()
     .setTitle("Мой статус")
     .setDescription([
       person
-        ? `Ты уже в пуле оцениваемых людей. Текущая строка: **${getRowLabel(rowId)}**.`
-        : "Тебя ещё нет в пуле оцениваемых людей. Кнопка «Начать оценку» автоматически добавит тебя.",
-      `Прогресс оценки: **${given.total}/${eligible}**. Осталось без твоей оценки: **${remaining}**. Готовность: **${progressPct}%**.`,
-      `Ты поставил обычных оценок: **${given.known}**. Нажатий «не знаю»: **${given.unknown}**.`,
-      `Тебе поставили оценок: **${received.total || 0}**. Обычных: **${received.knownCount || 0}**. «Не знаю»: **${received.unknownCount || 0}**.`,
-      `Текущая общая средняя по тебе: **${formatAverage(received.average)}**.`,
-      `Распределение полученных голосов: **${formatDistributionLine(received.distribution)}**.`,
-      activeTarget ? `Сейчас в активной сессии следующий человек: **${activeTarget.username || activeTarget.name || activeTarget.userId}**.` : "Активной карточки сейчас нет.",
-      lastTarget ? `Последний человек, которого ты оценил: **${lastTarget.username || lastTarget.name || lastTarget.userId}**. Последний выбор: **${session?.lastVoteValue === "unknown" ? "Не знаю" : session?.lastVoteValue || "—"}**.` : null,
-      person?.legacy?.tier ? `Legacy import найден. Старый tier: **${person.legacy.tier}**.` : null,
-      "Stage 3 завершён. Общая доска считает агрегат, чёрная строка раскладывается в два уровня, PNG-панель сохранена.",
+        ? `Ты в пуле оцениваемых. Текущая обычная строка: **${getRowLabel(rowId)}**. Влияние твоих голосов по строке: **x${getEvaluatorRowInfluence(userId).toFixed(2)}**.`
+        : "Тебя ещё нет в пуле оцениваемых. Кнопка «Начать оценку» автоматически добавит тебя.",
+      `Прогресс оценки: **${given.total}/${eligible}**. Осталось: **${remaining}**. Готовность: **${progressPct}%**.`,
+      `Ты выдал обычных оценок: **${given.known}**. Нажатий «Не знаю»: **${given.unknown}**.`,
+      `По тебе: всего голосов **${received.total || 0}**, обычных **${received.knownCount || 0}**, «Не знаю» **${received.unknownCount || 0}**.`,
+      `Текущая средняя по тебе: **${formatAverage(received.average)}**. Базовая средняя: **${formatAverage(received.baseAverage)}**. Bias: **${getTargetBias(userId) >= 0 ? "+" : ""}${getTargetBias(userId).toFixed(2)}**.`,
+      `Дистанция внутри строки: **${formatPromotionDemotionLine(received)}**.`,
+      `Распределение по тебе: **${formatDistributionLine(received.distribution)}**.`,
+      activeTarget ? `Сейчас на очереди: **${activeTarget.username || activeTarget.name || activeTarget.userId}**.` : "Активной карточки сейчас нет.",
+      lastTarget ? `Последний человек: **${lastTarget.username || lastTarget.name || lastTarget.userId}**. Последний выбор: **${session?.lastVoteValue === "unknown" ? "Не знаю" : session?.lastVoteValue || "—"}**.` : null,
+      session?.lastCommittedAt ? `Последнее слияние в общий тир-лист: **${session.lastCommittedAt}**.` : null,
     ].filter(Boolean).join("\n"));
+
+  const details = new EmbedBuilder()
+    .setTitle("Подробности")
+    .addFields(
+      { name: "Мои последние оценки", value: detailedGiven.length ? detailedGiven.join("\n") : "Пока пусто.", inline: false },
+      { name: "История сессии", value: historyLines.length ? historyLines.join("\n") : "Пока пусто.", inline: false },
+      { name: "Анонимные комментарии обо мне", value: anonymousComments.length ? anonymousComments.map((item, i) => `**${i + 1}.** ${item.text}`).join("\n\n") : "Пока нет.", inline: false },
+    );
 
   const personal = new EmbedBuilder()
     .setTitle("Мой личный тир-лист")
-    .setDescription("Это последний личный расклад людей, который ты уже составил.")
-    .addFields(buildPersonalTierFields(userId));
+    .setDescription("Это твой последний личный расклад. Внутри уже учтён черновик, если сессия ещё не закончена.")
+    .addFields(buildPersonalTierFields(userId, { includeDraft: true }));
 
-  const history = new EmbedBuilder()
-    .setTitle("Последние действия")
-    .setDescription(historyLines.length ? historyLines.join("\n") : "Пока история пуста.");
-
-  return { embeds: [summary, personal, history], ephemeral: true };
+  const payload = {
+    embeds: [summary, details, personal],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
+    )],
+    ephemeral: true,
+  };
+  const png = await renderPersonalTierlistPng(client, userId, { includeDraft: true, title: `Личный тир-лист ${person?.username || person?.name || userId}` }).catch(() => null);
+  if (png) {
+    const fileName = `personal-tierlist-${sanitizeFileName(userId, "png")}`;
+    const attachment = new AttachmentBuilder(png, { name: fileName });
+    payload.embeds.push(new EmbedBuilder().setTitle("Личный графический тир-лист").setImage(`attachment://${fileName}`));
+    payload.files = [attachment];
+  }
+  return payload;
 }
 
 function buildStartRatingText(created) {
   return created
-    ? "Ты добавлен в пул оцениваемых людей. Ниже сразу первая карточка."
-    : "Продолжаем. Ниже твоя текущая карточка на оценку.";
+    ? "Ты добавлен в пул оцениваемых людей. Ниже сразу первая карточка. Голоса пока идут в личный черновой тир-лист."
+    : "Продолжаем. Ниже твоя текущая карточка на оценку. Общий тир-лист обновится, когда личный черновик закончится и сольётся.";
 }
 
-function buildRateButtons(sessionId) {
+function buildRateButtons(sessionId, targetId) {
   return [
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:5`).setLabel("5").setStyle(ButtonStyle.Danger),
@@ -1022,66 +1636,79 @@ function buildRateButtons(sessionId) {
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:unknown`).setLabel("Не знаю").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`rate_comment:${sessionId}:${targetId}`).setLabel("Оставить комментарий").setStyle(ButtonStyle.Primary),
     ),
   ];
 }
 
 function buildSessionProgressLine(userId) {
-  const given = countVotesGivenBy(userId);
+  const given = countVotesGivenBy(userId, { includeDraft: true });
   const eligible = Math.max(0, getEligibleTargetIdsForEvaluator(userId).length);
   const remaining = Math.max(0, eligible - given.total);
   return `Прогресс: ${given.total}/${eligible}. Осталось: ${remaining}.`;
 }
 
 function buildNoTargetsPayload(userId, options = {}) {
-  const given = countVotesGivenBy(userId);
+  const given = countVotesGivenBy(userId, { includeDraft: true });
   const desc = [
     options.reason === "no-people"
       ? "Пока в пуле нет других людей для оценки."
       : "У тебя пока нет новых людей без оценки.",
     `Ты уже раздал голосов: **${given.total}**.`,
+    options.merged ? `Личный тир-лист слит в общий. Комментариев слито: **${options.merged.committedComments || 0}**. Голосов слито: **${options.merged.committedVotes || 0}**.` : null,
     "Когда модеры добавят новых людей или появятся новые аккаунты в пуле, кнопка «Начать оценку» снова даст карточку.",
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 
   return {
     embeds: [new EmbedBuilder().setTitle("Оценка завершена").setDescription(desc)],
-    components: [],
+    components: [new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("rate_my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
+    )],
     ephemeral: true,
   };
 }
 
-function buildRatingCardPayload(userId, session, options = {}) {
+async function buildRatingCardPayload(client, userId, session, options = {}) {
   const targetId = String(session?.activeTargetId || "");
   if (!targetId || !db.people?.[targetId]) {
-    return buildNoTargetsPayload(userId, { reason: Object.keys(db.people || {}).length <= 1 ? "no-people" : "finished" });
+    return buildNoTargetsPayload(userId, { reason: Object.keys(db.people || {}).length <= 1 ? "no-people" : "finished", merged: options.merged || null });
   }
 
   const person = db.people[targetId];
   const agg = person.stage2Aggregate || buildAggregateForTarget(targetId);
   const distributionLine = formatDistributionLine(agg.distribution);
+  const existingComment = getStoredComment(userId, targetId, { includeDraft: true });
   const embed = new EmbedBuilder()
     .setTitle("Оценка человека")
     .setDescription([
-      options.headerText || "Выбери тир или нажми «Не знаю». Голос сохраняется сразу.",
+      options.headerText || "Выбери тир, нажми «Не знаю» или оставь анонимный комментарий.",
       `**${person.username || person.name || person.userId}**`,
       `<@${person.userId}>`,
       buildSessionProgressLine(userId),
       `У него уже есть голосов: **${agg.total || 0}**. Обычных: **${agg.knownCount || 0}**. «Не знаю»: **${agg.unknownCount || 0}**.`,
       `Средняя: **${formatAverage(agg.average)}**. Общая строка: **${getRowLabel(getBoardRowForPerson(person))}**.`,
+      `Дистанция внутри строки: **${formatPromotionDemotionLine(agg)}**.`,
       `Распределение: **${distributionLine}**.`,
+      existingComment?.text ? `Твой анонимный комментарий к нему уже есть. Длина: **${existingComment.text.length}**.` : "Анонимный комментарий пока не оставлен.",
       options.lastActionText || null,
     ].filter(Boolean).join("\n"));
 
   if (person.avatarUrl) embed.setThumbnail(person.avatarUrl);
 
-  return {
+  const payload = {
     embeds: [embed],
-    components: buildRateButtons(session.sessionId),
+    components: buildRateButtons(session.sessionId, targetId),
     ephemeral: true,
   };
+  const png = await renderPersonalTierlistPng(client, userId, { includeDraft: true, title: `Личный тир-лист ${db.people?.[userId]?.username || db.people?.[userId]?.name || userId}` }).catch(() => null);
+  if (png) {
+    const fileName = `personal-progress-${sanitizeFileName(userId, "png")}`;
+    payload.files = [new AttachmentBuilder(png, { name: fileName })];
+    payload.embeds.push(new EmbedBuilder().setTitle("Твой личный графический тир-лист").setImage(`attachment://${fileName}`));
+  }
+  return payload;
 }
-
-
 // ====== GRAPHIC TIERLIST / PNG ======
 function getGraphicTierlistState() {
   applyDbDefaults();
@@ -1581,13 +2208,6 @@ async function renderGraphicTierlistPng(client = null) {
       const usernameY = yy + rowIcon - Math.max(5, Math.floor((usernameBarH - usernameFit.px) / 2)) - 1;
       ctx.fillText(usernameFit.text, centerGraphicTextX(ctx, usernameFit.text, x, rowIcon), usernameY);
 
-      const badgeText = String(player.badgeText || "");
-      const badgePx = Math.max(14, Math.floor(rowIcon * 0.22));
-      setGraphicFont(ctx, badgePx, "bold");
-      const badgeW = measureGraphicTextWidth(ctx, badgeText);
-      const badgeX = x + rowIcon - badgeW - 8;
-      const badgeY = yy + badgePx + 8;
-      drawGraphicOutlinedText(ctx, badgeText, badgeX, badgeY, "#ffffff", "#000000");
     }
   }
 
@@ -1597,6 +2217,16 @@ async function renderGraphicTierlistPng(client = null) {
   await PImage.encodePNGToStream(img, stream);
   stream.end();
   return Buffer.concat(chunks);
+}
+
+function formatCoefficientListLines() {
+  const cfg = getCoefficientConfig();
+  return [
+    `global vote weights: 5=${getGlobalRowWeight("5").toFixed(2)} 4=${getGlobalRowWeight("4").toFixed(2)} 3=${getGlobalRowWeight("3").toFixed(2)} 2=${getGlobalRowWeight("2").toFixed(2)} 1=${getGlobalRowWeight("1").toFixed(2)} unknown=${getGlobalRowWeight("unknown").toFixed(2)}`,
+    `row influence: 5=${getRowInfluenceWeight("5").toFixed(3)} 4=${getRowInfluenceWeight("4").toFixed(3)} 3=${getRowInfluenceWeight("3").toFixed(3)} 2=${getRowInfluenceWeight("2").toFixed(3)} 1=${getRowInfluenceWeight("1").toFixed(3)} unknown=${getRowInfluenceWeight("unknown").toFixed(3)} new=${getRowInfluenceWeight("new").toFixed(3)}`,
+    `person evaluator overrides: ${Object.keys(cfg.evaluatorWeights || {}).length}`,
+    `person target bias overrides: ${Object.keys(cfg.targetBiases || {}).length}`,
+  ];
 }
 
 let graphicRefreshPromise = Promise.resolve(false);
@@ -1620,6 +2250,7 @@ function buildGraphicDashboardComponents() {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("rate_start").setLabel("Начать оценку").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("rate_my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
     ),
     new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("graphic_refresh").setLabel("Обновить PNG").setStyle(ButtonStyle.Secondary),
@@ -1821,7 +2452,7 @@ function buildCommands() {
         .addChannelOption((o) => o.setName("channel").setDescription("Канал для PNG тир-листа").setRequired(true)))
       .addSubcommand((s) => s.setName("rebuild").setDescription("Пересобрать PNG тир-лист (модеры)"))
       .addSubcommand((s) => s.setName("bump").setDescription("Отправить PNG тир-лист заново вниз канала (модеры)"))
-      .addSubcommand((s) => s.setName("dashboard-status").setDescription("Статус PNG тир-листа и stage 1 базы (модеры)"))
+      .addSubcommand((s) => s.setName("dashboard-status").setDescription("Статус PNG тир-листа и базы (модеры)"))
       .addSubcommand((s) => s.setName("panel").setDescription("Панель PNG тир-листа (модеры)"))
       .addSubcommand((s) => s.setName("add-person").setDescription("Добавить человека в пул оцениваемых (модеры)")
         .addUserOption((o) => o.setName("target").setDescription("Пользователь").setRequired(true))
@@ -1846,6 +2477,37 @@ function buildCommands() {
         .addStringOption((o) => o.setName("r1").setDescription("Название строки 1").setRequired(true))
         .addStringOption((o) => o.setName("unknown").setDescription("Название чёрной строки").setRequired(true))
         .addStringOption((o) => o.setName("new").setDescription("Название нижней строки").setRequired(true)))
+      .addSubcommand((s) => s.setName("set-global-coefficients").setDescription("Настроить глобальные коэффициенты общего тир-листа (модеры)")
+        .addNumberOption((o) => o.setName("r5").setDescription("Вес голоса 5").setRequired(true))
+        .addNumberOption((o) => o.setName("r4").setDescription("Вес голоса 4").setRequired(true))
+        .addNumberOption((o) => o.setName("r3").setDescription("Вес голоса 3").setRequired(true))
+        .addNumberOption((o) => o.setName("r2").setDescription("Вес голоса 2").setRequired(true))
+        .addNumberOption((o) => o.setName("r1").setDescription("Вес голоса 1").setRequired(true))
+        .addNumberOption((o) => o.setName("unknown").setDescription("Вес нажатия Не знаю").setRequired(true)))
+      .addSubcommand((s) => s.setName("set-person-coefficient").setDescription("Настроить индивидуальный коэффициент человека (модеры)")
+        .addUserOption((o) => o.setName("target").setDescription("Пользователь").setRequired(true))
+        .addStringOption((o) => o.setName("kind").setDescription("Тип индивидуального коэффициента").setRequired(true)
+          .addChoices(
+            { name: "evaluator_weight", value: "evaluator_weight" },
+            { name: "target_bias", value: "target_bias" },
+            { name: "reset", value: "reset" },
+          ))
+        .addNumberOption((o) => o.setName("value").setDescription("Значение. Для bias можно отрицательное.").setRequired(false)))
+      .addSubcommand((s) => s.setName("coeff-status").setDescription("Показать текущие коэффициенты (модеры)")
+        .addUserOption((o) => o.setName("target").setDescription("Пользователь").setRequired(false)))
+      .addSubcommand((s) => s.setName("set-row-influence")
+        .setDescription("Настроить влияние строк на силу голосов (модеры)")
+        .addNumberOption((o) => o.setName("r5").setDescription("Влияние строки 5").setRequired(true))
+        .addNumberOption((o) => o.setName("r4").setDescription("Влияние строки 4").setRequired(true))
+        .addNumberOption((o) => o.setName("r3").setDescription("Влияние строки 3").setRequired(true))
+        .addNumberOption((o) => o.setName("r2").setDescription("Влияние строки 2").setRequired(true))
+        .addNumberOption((o) => o.setName("r1").setDescription("Влияние строки 1").setRequired(true))
+        .addNumberOption((o) => o.setName("unknown").setDescription("Влияние строки не знают").setRequired(false))
+        .addNumberOption((o) => o.setName("new").setDescription("Влияние строки новые").setRequired(false)))
+      .addSubcommand((s) => s.setName("analyze-votes").setDescription("Посмотреть кто кому что поставил (модеры)")
+        .addUserOption((o) => o.setName("evaluator").setDescription("Кто ставил").setRequired(false))
+        .addUserOption((o) => o.setName("target").setDescription("Кому ставили").setRequired(false))
+        .addIntegerOption((o) => o.setName("limit").setDescription("Сколько строк показать").setRequired(false)))
   ].map((c) => c.toJSON());
 }
 
@@ -1919,7 +2581,7 @@ client.on("interactionCreate", async (interaction) => {
     const sub = interaction.options.getSubcommand();
 
     if (sub === "my-status") {
-      await interaction.reply(buildMyStatusPayload(interaction.user.id));
+      await interaction.reply(await buildMyStatusPayload(client, interaction.user.id));
       return;
     }
 
@@ -1974,6 +2636,7 @@ client.on("interactionCreate", async (interaction) => {
         `voteMaps: ${Object.keys(db.votes || {}).length}`,
         `sessions: ${Object.keys(db.sessions || {}).length}`,
         `stageMeta: schema=${db.meta?.schemaVersion || 0}, stage=${db.meta?.stage || 0}`,
+        ...formatCoefficientListLines(),
         `legacy migrated: ${db.legacy?.migratedFromRatings ? `yes (${db.legacy?.importedRatings || 0})` : "no"}`,
         `font regular: ${GRAPHIC_FONT_INFO.regularFile ? path.basename(GRAPHIC_FONT_INFO.regularFile) : "(none)"}`,
         `font bold: ${GRAPHIC_FONT_INFO.boldFile ? path.basename(GRAPHIC_FONT_INFO.boldFile) : "(none)"}`,
@@ -2045,6 +2708,61 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (sub === "set-global-coefficients") {
+      await interaction.deferReply({ ephemeral: true });
+      setGlobalRowWeight("5", interaction.options.getNumber("r5", true));
+      setGlobalRowWeight("4", interaction.options.getNumber("r4", true));
+      setGlobalRowWeight("3", interaction.options.getNumber("r3", true));
+      setGlobalRowWeight("2", interaction.options.getNumber("r2", true));
+      setGlobalRowWeight("1", interaction.options.getNumber("r1", true));
+      setGlobalRowWeight("unknown", interaction.options.getNumber("unknown", true));
+      refreshAllPeopleDerivedState();
+      saveDB(db);
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply({ content: `Глобальные коэффициенты обновлены. ${formatCoefficientListLines().join(" | ")}` });
+      return;
+    }
+
+    if (sub === "set-person-coefficient") {
+      await interaction.deferReply({ ephemeral: true });
+      const target = interaction.options.getUser("target", true);
+      const kind = interaction.options.getString("kind", true);
+      const value = interaction.options.getNumber("value", false);
+      if (kind === "reset") {
+        clearPersonCoefficients(target.id);
+      } else if (kind === "evaluator_weight") {
+        if (!Number.isFinite(value) || value <= 0) {
+          await interaction.editReply({ content: "Для evaluator_weight нужен value больше 0." });
+          return;
+        }
+        setEvaluatorWeight(target.id, value);
+      } else if (kind === "target_bias") {
+        if (!Number.isFinite(value)) {
+          await interaction.editReply({ content: "Для target_bias нужен value. Можно отрицательный." });
+          return;
+        }
+        setTargetBias(target.id, value);
+      }
+      refreshAllPeopleDerivedState();
+      saveDB(db);
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply({ content: `Индивидуальный коэффициент обновлён для <@${target.id}>. evaluator=x${getEvaluatorWeight(target.id).toFixed(2)} bias=${getTargetBias(target.id).toFixed(2)}` });
+      return;
+    }
+
+    if (sub === "coeff-status") {
+      const target = interaction.options.getUser("target", false);
+      if (target) {
+        await interaction.reply({
+          content: [`<@${target.id}>`, `evaluator weight: x${getEvaluatorWeight(target.id).toFixed(2)}`, `target bias: ${getTargetBias(target.id).toFixed(2)}`].join("\n"),
+          ephemeral: true,
+        });
+        return;
+      }
+      await interaction.reply({ content: formatCoefficientListLines().join("\n"), ephemeral: true });
+      return;
+    }
+
     return;
   }
 
@@ -2054,7 +2772,7 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
       const res = await upsertPersonFromUser(client, interaction.user, { source: "self-start" });
       const session = ensureStage2Session(interaction.user.id);
-      await interaction.editReply(buildRatingCardPayload(interaction.user.id, session, {
+      await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, session, {
         headerText: buildStartRatingText(res.created),
       }));
       void scheduleGraphicTierlistRefresh(client);
@@ -2062,7 +2780,35 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.customId === "rate_my_status") {
-      await interaction.reply(buildMyStatusPayload(interaction.user.id));
+      await interaction.reply(await buildMyStatusPayload(client, interaction.user.id));
+      return;
+    }
+
+    if (interaction.customId === "rate_reset_all") {
+      await interaction.deferReply({ ephemeral: true });
+      const cleared = resetEvaluatorProgress(interaction.user.id);
+      const session = ensureStage2Session(interaction.user.id, { forceNew: true });
+      await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, session, {
+        headerText: `Твои старые голоса очищены. Удалено голосов: ${cleared.clearedVotes}. Комментариев: ${cleared.clearedComments}. Начинаем заново.`,
+      }));
+      void scheduleGraphicTierlistRefresh(client);
+      return;
+    }
+
+    if (interaction.customId.startsWith("rate_comment:")) {
+      const [, sessionId = "", targetId = ""] = String(interaction.customId).split(":");
+      const person = db.people?.[targetId] || null;
+      const modal = new ModalBuilder().setCustomId(`rate_comment_modal:${sessionId}:${targetId}`).setTitle("Анонимный комментарий");
+      const existing = getStoredComment(interaction.user.id, targetId, { includeDraft: true });
+      const input = new TextInputBuilder()
+        .setCustomId("comment_text")
+        .setLabel(person ? `Комментарий для ${person.username || person.name || person.userId}` : "Комментарий")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false)
+        .setMaxLength(1000)
+        .setValue(String(existing?.text || "").slice(0, 1000));
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      await interaction.showModal(modal);
       return;
     }
 
@@ -2074,7 +2820,7 @@ client.on("interactionCreate", async (interaction) => {
       if (!result.ok) {
         if (result.reason === "stale-session") {
           const fresh = result.session || ensureStage2Session(interaction.user.id, { forceNew: true });
-          await interaction.editReply(buildRatingCardPayload(interaction.user.id, fresh, {
+          await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, fresh, {
             headerText: "Старая карточка устарела. Ниже уже свежая.",
           }));
           return;
@@ -2082,7 +2828,7 @@ client.on("interactionCreate", async (interaction) => {
 
         if (result.reason === "no-target" || result.reason === "self-target") {
           const session = result.session || ensureStage2Session(interaction.user.id);
-          await interaction.editReply(buildRatingCardPayload(interaction.user.id, session, {
+          await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, session, {
             headerText: "Текущая цель пропала или стала невалидной. Беру следующую.",
           }));
           return;
@@ -2092,11 +2838,12 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      await interaction.editReply(buildRatingCardPayload(interaction.user.id, result.session, {
-        headerText: "Голос сохранён.",
-        lastActionText: `Последний выбор: **${result.written.vote.value === "unknown" ? "Не знаю" : result.written.vote.value}** для **${db.people?.[result.targetId]?.username || db.people?.[result.targetId]?.name || result.targetId}**.`,
+      await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, result.session, {
+        headerText: result.committed ? "Голос сохранён. Личный тир-лист закончен и слит в общий." : "Голос сохранён в личный тир-лист.",
+        lastActionText: `Последний выбор: **${result.written.vote.value === "unknown" ? "Не знаю" : result.written.vote.value}** для **${db.people?.[result.targetId]?.username || db.people?.[result.targetId]?.name || result.targetId}**.${result.committed ? ` Слитых голосов: ${result.committed.committedVotes || 0}.` : ""}`,
+        merged: result.committed || null,
       }));
-      void scheduleGraphicTierlistRefresh(client);
+      if (result.committed) void scheduleGraphicTierlistRefresh(client);
       return;
     }
 
@@ -2292,6 +3039,18 @@ client.on("interactionCreate", async (interaction) => {
 
   // ----- MODALS -----
   if (interaction.isModalSubmit()) {
+    if (interaction.customId.startsWith("rate_comment_modal:")) {
+      const [, sessionId = "", targetId = ""] = String(interaction.customId).split(":");
+      const text = interaction.fields.getTextInputValue("comment_text") || "";
+      const result = applyCommentFromSession(interaction.user.id, sessionId, targetId, text);
+      if (!result.ok) {
+        await interaction.reply({ content: result.reason === "stale-session" ? "Сессия уже устарела. Нажми Начать оценку заново." : "Не удалось сохранить комментарий.", ephemeral: true });
+        return;
+      }
+      await interaction.reply({ content: result.comment?.text ? "Анонимный комментарий сохранён. Он станет доступен человеку в Мой статус, когда личный тир-лист сольётся в общий." : "Комментарий очищен.", ephemeral: true });
+      return;
+    }
+
     if (!isModerator(interaction.member)) {
       await interaction.reply({ content: "Нет прав.", ephemeral: true });
       return;
