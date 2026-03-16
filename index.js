@@ -271,6 +271,10 @@ let GRAPHIC_FONT_BOLD = "GraphicFontBold";
 let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false, source: "none", loadError: null };
 const graphicAvatarCache = new Map();
 
+const voteAuditPanels = new Map();
+const VOTE_AUDIT_PAGE_SIZES = [5, 10, 15];
+const VOTE_AUDIT_TTL_MS = 1000 * 60 * 30;
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -1211,6 +1215,294 @@ function buildDetailedGivenLines(userId, max = 12) {
   }
   rows.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(a.label).localeCompare(String(b.label), "ru"));
   return rows.slice(0, max).map((row) => `• ${row.label} → ${row.value === "unknown" ? "Не знаю" : row.value}${row.comment ? ` | комм: ${row.comment.slice(0, 70)}` : ""}`);
+}
+
+
+function getCommittedVoteRows(filters = {}) {
+  const rows = [];
+  const valueFilter = normalizeVoteValue(filters.value || "");
+  const commentsOnly = !!filters.commentsOnly;
+
+  for (const [evaluatorId, voterMap] of Object.entries(db.votes || {})) {
+    for (const [targetId, vote] of Object.entries(voterMap || {})) {
+      const value = normalizeVoteValue(vote?.value);
+      if (!value) continue;
+      if (filters.evaluatorId && evaluatorId !== filters.evaluatorId) continue;
+      if (filters.targetId && targetId !== filters.targetId) continue;
+      if (valueFilter && value !== valueFilter) continue;
+
+      const evaluator = db.people?.[evaluatorId];
+      const target = db.people?.[targetId];
+      const comment = String(db.comments?.[evaluatorId]?.[targetId]?.text || "").trim();
+      if (commentsOnly && !comment) continue;
+
+      rows.push({
+        evaluatorId,
+        evaluatorLabel: evaluator?.username || evaluator?.name || evaluatorId,
+        targetId,
+        targetLabel: target?.username || target?.name || targetId,
+        value,
+        updatedAt: String(vote?.updatedAt || vote?.createdAt || ""),
+        comment,
+        evaluatorWeight: getEvaluatorWeight(evaluatorId),
+        rowInfluence: getEvaluatorRowInfluence(evaluatorId),
+      });
+    }
+  }
+
+  rows.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)) || String(a.evaluatorLabel).localeCompare(String(b.evaluatorLabel), "ru"));
+  return rows;
+}
+
+function normalizeVoteAuditPageSize(input) {
+  const raw = Number(input);
+  if (!Number.isFinite(raw)) return VOTE_AUDIT_PAGE_SIZES[1];
+  let best = VOTE_AUDIT_PAGE_SIZES[0];
+  let bestDelta = Math.abs(best - raw);
+  for (const value of VOTE_AUDIT_PAGE_SIZES) {
+    const delta = Math.abs(value - raw);
+    if (delta < bestDelta) {
+      best = value;
+      bestDelta = delta;
+    }
+  }
+  return best;
+}
+
+function cycleVoteAuditPageSize(input) {
+  const current = normalizeVoteAuditPageSize(input);
+  const idx = VOTE_AUDIT_PAGE_SIZES.indexOf(current);
+  return VOTE_AUDIT_PAGE_SIZES[(idx + 1) % VOTE_AUDIT_PAGE_SIZES.length] || VOTE_AUDIT_PAGE_SIZES[0];
+}
+
+function cleanupVoteAuditPanels() {
+  const now = Date.now();
+  for (const [panelId, state] of voteAuditPanels.entries()) {
+    const updatedAt = new Date(state?.updatedAt || state?.createdAt || 0).getTime();
+    if (!updatedAt || now - updatedAt > VOTE_AUDIT_TTL_MS) voteAuditPanels.delete(panelId);
+  }
+}
+
+function createVoteAuditPanel(ownerId, initial = {}) {
+  cleanupVoteAuditPanels();
+  const panelId = makeId().slice(0, 14);
+  const state = {
+    panelId,
+    ownerId,
+    evaluatorId: String(initial.evaluatorId || "").trim(),
+    targetId: String(initial.targetId || "").trim(),
+    value: normalizeVoteValue(initial.value || ""),
+    commentsOnly: !!initial.commentsOnly,
+    pageSize: normalizeVoteAuditPageSize(initial.pageSize),
+    page: Math.max(0, Number(initial.page) || 0),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+  voteAuditPanels.set(panelId, state);
+  return state;
+}
+
+function getVoteAuditPanel(panelId) {
+  cleanupVoteAuditPanels();
+  const state = voteAuditPanels.get(String(panelId || "")) || null;
+  if (!state) return null;
+  state.updatedAt = nowIso();
+  return state;
+}
+
+function getPersonDisplayLabel(userId) {
+  const person = db.people?.[userId];
+  return String(person?.username || person?.name || userId || "—").trim() || "—";
+}
+
+function formatVoteAuditValueLabel(value) {
+  const normalized = normalizeVoteValue(value || "");
+  if (!normalized) return "Все";
+  return normalized === "unknown" ? "Не знаю" : normalized;
+}
+
+function formatVoteAuditDate(iso) {
+  const text = String(iso || "").trim();
+  if (!text) return "—";
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return text.slice(0, 16).replace("T", " ");
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(date.getDate())}.${pad(date.getMonth() + 1)} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function summarizeVoteAuditRows(rows) {
+  const distribution = { "5": 0, "4": 0, "3": 0, "2": 0, "1": 0, unknown: 0 };
+  let commentCount = 0;
+  for (const row of rows) {
+    const value = normalizeVoteValue(row?.value);
+    if (value) distribution[value] = (distribution[value] || 0) + 1;
+    if (row?.comment) commentCount++;
+  }
+  return { distribution, commentCount };
+}
+
+function formatVoteAuditRowLine(row, index) {
+  const left = `${index}. ${row.evaluatorLabel} → ${row.targetLabel} = ${row.value === "unknown" ? "Не знаю" : row.value}`;
+  const middle = `${formatVoteAuditDate(row.updatedAt)} | eval x${row.evaluatorWeight.toFixed(2)} | row x${row.rowInfluence.toFixed(2)}`;
+  const comment = row.comment ? ` | комм: ${row.comment.replace(/\s+/g, " ").slice(0, 70)}` : "";
+  return `${left} | ${middle}${comment}`;
+}
+
+function resolveVoteAuditPersonQuery(raw) {
+  const query = String(raw || "").trim();
+  if (!query) return { ok: true, userId: "", cleared: true };
+
+  const idMatch = query.match(/^(?:<@!?(\d{5,25})>|(\d{5,25}))$/);
+  const directId = idMatch ? (idMatch[1] || idMatch[2] || "") : "";
+  if (directId) {
+    const hasPerson = !!db.people?.[directId];
+    const hasVotes = !!db.votes?.[directId] || Object.values(db.votes || {}).some((map) => !!map?.[directId]);
+    if (hasPerson || hasVotes) return { ok: true, userId: directId };
+    return { ok: false, error: "По этому ID нет человека в пуле и нет голосов." };
+  }
+
+  const normalized = query.toLowerCase();
+  const candidates = [];
+  for (const [userId, person] of Object.entries(db.people || {})) {
+    const username = String(person?.username || "").trim();
+    const name = String(person?.name || "").trim();
+    const hay = `${username}\n${name}\n${userId}`.toLowerCase();
+    if (!hay.includes(normalized)) continue;
+    const exact = username.toLowerCase() === normalized || name.toLowerCase() === normalized;
+    const starts = username.toLowerCase().startsWith(normalized) || name.toLowerCase().startsWith(normalized);
+    candidates.push({ userId, label: username || name || userId, exact, starts });
+  }
+
+  candidates.sort((a, b) => Number(b.exact) - Number(a.exact) || Number(b.starts) - Number(a.starts) || a.label.localeCompare(b.label, "ru"));
+
+  if (!candidates.length) return { ok: false, error: "Никого не нашёл. Введи ID, @упоминание или точнее ник." };
+  if (candidates.length > 1 && !candidates[0].exact && !candidates[0].starts) {
+    return { ok: false, error: `Нашлось несколько людей: ${candidates.slice(0, 5).map((x) => x.label).join(", ")}. Введи точнее.` };
+  }
+  return { ok: true, userId: candidates[0].userId };
+}
+
+function buildVoteAuditPanelComponents(state, totalRows, totalPages) {
+  const page = Math.max(0, Math.min(totalPages - 1, Number(state?.page) || 0));
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`vote_audit_set_eval:${state.panelId}`).setLabel("Оценщик").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`vote_audit_set_target:${state.panelId}`).setLabel("Цель").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`vote_audit_reset:${state.panelId}`).setLabel("Сброс").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`vote_audit_refresh:${state.panelId}`).setLabel("Обновить").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`vote_audit_close:${state.panelId}`).setLabel("Закрыть").setStyle(ButtonStyle.Danger),
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`vote_audit_prev:${state.panelId}`).setLabel("←").setStyle(ButtonStyle.Secondary).setDisabled(page <= 0 || totalRows === 0),
+    new ButtonBuilder().setCustomId(`vote_audit_page:${state.panelId}`).setLabel(`Стр ${Math.max(1, page + 1)}/${Math.max(1, totalPages)}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`vote_audit_next:${state.panelId}`).setLabel("→").setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1 || totalRows === 0),
+    new ButtonBuilder().setCustomId(`vote_audit_limit:${state.panelId}`).setLabel(`Лимит ${state.pageSize}`).setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`vote_audit_comments:${state.panelId}`).setLabel(state.commentsOnly ? "Комменты: да" : "Комменты: нет").setStyle(state.commentsOnly ? ButtonStyle.Success : ButtonStyle.Secondary),
+  );
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`vote_audit_value:${state.panelId}`)
+    .setPlaceholder(`Оценка: ${formatVoteAuditValueLabel(state.value)}`)
+    .addOptions(
+      { label: "Все оценки", value: "all", default: !state.value },
+      { label: "Только 5", value: "5", default: state.value === "5" },
+      { label: "Только 4", value: "4", default: state.value === "4" },
+      { label: "Только 3", value: "3", default: state.value === "3" },
+      { label: "Только 2", value: "2", default: state.value === "2" },
+      { label: "Только 1", value: "1", default: state.value === "1" },
+      { label: "Только Не знаю", value: "unknown", default: state.value === "unknown" },
+    );
+
+  return [row1, row2, new ActionRowBuilder().addComponents(select)];
+}
+
+function buildVoteAuditPanelPayload(panelId, options = {}) {
+  const state = getVoteAuditPanel(panelId);
+  if (!state) {
+    return {
+      embeds: [new EmbedBuilder().setTitle("Панель голосов устарела").setDescription("Открой её заново через команду." )],
+      components: [],
+      ephemeral: true,
+    };
+  }
+
+  const filteredRows = getCommittedVoteRows({
+    evaluatorId: state.evaluatorId,
+    targetId: state.targetId,
+    value: state.value,
+    commentsOnly: state.commentsOnly,
+  });
+  const summary = summarizeVoteAuditRows(filteredRows);
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / state.pageSize));
+  state.page = Math.max(0, Math.min(totalPages - 1, Number(state.page) || 0));
+  const start = state.page * state.pageSize;
+  const pageRows = filteredRows.slice(start, start + state.pageSize);
+  const lines = pageRows.length
+    ? pageRows.map((row, idx) => formatVoteAuditRowLine(row, start + idx + 1))
+    : ["Совпадений нет."];
+
+  const embed = new EmbedBuilder()
+    .setTitle("Панель просмотра голосов")
+    .setDescription([
+      options.headerText || "Смотри матрицу голосов по людям.",
+      `Оценщик: **${state.evaluatorId ? getPersonDisplayLabel(state.evaluatorId) : "все"}**`,
+      `Цель: **${state.targetId ? getPersonDisplayLabel(state.targetId) : "все"}**`,
+      `Оценка: **${formatVoteAuditValueLabel(state.value)}** | Только с комментами: **${state.commentsOnly ? "да" : "нет"}**`,
+      `Найдено: **${filteredRows.length}** | На странице: **${pageRows.length}** | Лимит: **${state.pageSize}**`,
+      `Распределение: **${formatDistributionLine(summary.distribution)}** | Комментов: **${summary.commentCount}**`,
+      "",
+      lines.join("\n"),
+    ].join("\n").slice(0, 4090));
+
+  if (state.targetId) {
+    const agg = buildAggregateForTarget(state.targetId);
+    embed.addFields({
+      name: `Статистика по цели: ${getPersonDisplayLabel(state.targetId)}`,
+      value: [
+        `Среднее: **${formatAverage(agg.average)}**`,
+        `Голосов: **${agg.total}** | Известных: **${agg.knownCount}** | Не знаю: **${agg.unknownCount}**`,
+        `Ряд: **${getRowLabel(agg.rowId)}** | ${formatPromotionDemotionLine(agg)}`,
+      ].join("\n").slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  if (state.evaluatorId) {
+    const given = countVotesGivenBy(state.evaluatorId, { includeDraft: false });
+    embed.addFields({
+      name: `Статистика по оценщику: ${getPersonDisplayLabel(state.evaluatorId)}`,
+      value: [
+        `Дал голосов: **${given.total}**`,
+        `Обычных: **${given.known}** | Не знаю: **${given.unknown}**`,
+        `Личный вес: **x${getEvaluatorWeight(state.evaluatorId).toFixed(2)}** | Вес строки: **x${getEvaluatorRowInfluence(state.evaluatorId).toFixed(2)}**`,
+      ].join("\n").slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  return {
+    embeds: [embed],
+    components: buildVoteAuditPanelComponents(state, filteredRows.length, totalPages),
+    ephemeral: true,
+  };
+}
+
+async function updateVoteAuditModalInteraction(interaction, payload) {
+  try {
+    if (typeof interaction.update === "function") {
+      await interaction.update(payload);
+      return true;
+    }
+  } catch {}
+
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.reply(payload);
+      return true;
+    }
+  } catch {}
+
+  return false;
 }
 
 async function importRoleMembers(client, role) {
@@ -2700,10 +2992,10 @@ function buildCommands() {
         .addNumberOption((o) => o.setName("r1").setDescription("Влияние строки 1").setRequired(true))
         .addNumberOption((o) => o.setName("unknown").setDescription("Влияние строки не знают").setRequired(false))
         .addNumberOption((o) => o.setName("new").setDescription("Влияние строки новые").setRequired(false)))
-      .addSubcommand((s) => s.setName("analyze-votes").setDescription("Посмотреть кто кому что поставил (модеры)")
-        .addUserOption((o) => o.setName("evaluator").setDescription("Кто ставил").setRequired(false))
-        .addUserOption((o) => o.setName("target").setDescription("Кому ставили").setRequired(false))
-        .addIntegerOption((o) => o.setName("limit").setDescription("Сколько строк показать").setRequired(false)))
+      .addSubcommand((s) => s.setName("analyze-votes").setDescription("Открыть панель просмотра кто кому что поставил (модеры)")
+        .addUserOption((o) => o.setName("evaluator").setDescription("Сразу открыть по оценщику").setRequired(false))
+        .addUserOption((o) => o.setName("target").setDescription("Сразу открыть по цели").setRequired(false))
+        .addIntegerOption((o) => o.setName("limit").setDescription("Строк на страницу: 5, 10 или 15").setRequired(false)))
   ].map((c) => c.toJSON());
 }
 
@@ -2959,6 +3251,21 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (sub === "analyze-votes") {
+      const evaluator = interaction.options.getUser("evaluator", false);
+      const target = interaction.options.getUser("target", false);
+      const limit = interaction.options.getInteger("limit", false);
+      const panel = createVoteAuditPanel(interaction.user.id, {
+        evaluatorId: evaluator?.id || "",
+        targetId: target?.id || "",
+        pageSize: limit || VOTE_AUDIT_PAGE_SIZES[1],
+      });
+      await interaction.reply(buildVoteAuditPanelPayload(panel.panelId, {
+        headerText: `Открыта админ-панель голосов. Команда: /${ROOT_COMMAND_NAME} analyze-votes`,
+      }));
+      return;
+    }
+
     return;
   }
 
@@ -3060,6 +3367,103 @@ client.on("interactionCreate", async (interaction) => {
       if (payload.autoDeleteMs) scheduleEphemeralDelete(interaction, payload.autoDeleteMs);
       if (result.committed) void scheduleGraphicTierlistRefresh(client);
       return;
+    }
+
+    if (interaction.customId.startsWith("vote_audit_")) {
+      const [, action = "", panelId = ""] = String(interaction.customId).match(/^vote_audit_([^:]+):?(.*)$/) || [];
+      const panel = getVoteAuditPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+
+      if (action === "close") {
+        await interaction.update({ content: "Панель голосов закрыта.", embeds: [], components: [] });
+        return;
+      }
+
+      if (action === "set_eval") {
+        const modal = new ModalBuilder().setCustomId(`vote_audit_eval_modal:${panel.panelId}`).setTitle("Фильтр по оценщику");
+        const input = new TextInputBuilder()
+          .setCustomId("audit_person_query")
+          .setLabel("ID, @упоминание или ник. Пусто = сброс")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setMaxLength(120)
+          .setValue(panel.evaluatorId ? getPersonDisplayLabel(panel.evaluatorId).slice(0, 120) : "");
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === "set_target") {
+        const modal = new ModalBuilder().setCustomId(`vote_audit_target_modal:${panel.panelId}`).setTitle("Фильтр по цели");
+        const input = new TextInputBuilder()
+          .setCustomId("audit_person_query")
+          .setLabel("ID, @упоминание или ник. Пусто = сброс")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setMaxLength(120)
+          .setValue(panel.targetId ? getPersonDisplayLabel(panel.targetId).slice(0, 120) : "");
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === "reset") {
+        panel.evaluatorId = "";
+        panel.targetId = "";
+        panel.value = "";
+        panel.commentsOnly = false;
+        panel.page = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: "Фильтры сброшены." }));
+        return;
+      }
+
+      if (action === "refresh") {
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: "Панель обновлена." }));
+        return;
+      }
+
+      if (action === "prev") {
+        panel.page = Math.max(0, Number(panel.page || 0) - 1);
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId));
+        return;
+      }
+
+      if (action === "next") {
+        panel.page = Math.max(0, Number(panel.page || 0) + 1);
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId));
+        return;
+      }
+
+      if (action === "limit") {
+        panel.pageSize = cycleVoteAuditPageSize(panel.pageSize);
+        panel.page = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: `Лимит на страницу теперь ${panel.pageSize}.` }));
+        return;
+      }
+
+      if (action === "comments") {
+        panel.commentsOnly = !panel.commentsOnly;
+        panel.page = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: panel.commentsOnly ? "Показываю только голоса с комментариями." : "Снова показываю все голоса." }));
+        return;
+      }
     }
 
     if (interaction.customId === "graphic_refresh") {
@@ -3238,6 +3642,31 @@ client.on("interactionCreate", async (interaction) => {
 
   // ----- SELECT MENU -----
   if (interaction.isStringSelectMenu()) {
+    if (interaction.customId.startsWith("vote_audit_value:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getVoteAuditPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+      const picked = String(interaction.values?.[0] || "all");
+      panel.value = picked === "all" ? "" : normalizeVoteValue(picked);
+      panel.page = 0;
+      panel.updatedAt = nowIso();
+      await interaction.update(buildVoteAuditPanelPayload(panel.panelId, {
+        headerText: `Фильтр по оценке: ${formatVoteAuditValueLabel(panel.value)}.`,
+      }));
+      return;
+    }
+
     if (!isModerator(interaction.member)) {
       await interaction.reply({ content: "Нет прав.", ephemeral: true });
       return;
@@ -3263,6 +3692,47 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
       await interaction.reply({ content: result.comment?.text ? "Анонимный комментарий сохранён. Он станет доступен человеку в Мой статус, когда личный тир-лист сольётся в общий." : "Комментарий очищен.", ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith("vote_audit_eval_modal:") || interaction.customId.startsWith("vote_audit_target_modal:")) {
+      const isEval = interaction.customId.startsWith("vote_audit_eval_modal:");
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getVoteAuditPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+
+      const raw = interaction.fields.getTextInputValue("audit_person_query") || "";
+      const resolved = resolveVoteAuditPersonQuery(raw);
+      if (!resolved.ok) {
+        await interaction.reply({ content: resolved.error, ephemeral: true });
+        return;
+      }
+
+      if (isEval) panel.evaluatorId = resolved.userId || "";
+      else panel.targetId = resolved.userId || "";
+      panel.page = 0;
+      panel.updatedAt = nowIso();
+
+      const label = isEval ? "оценщика" : "цели";
+      const headerText = resolved.cleared
+        ? `Фильтр ${label} очищен.`
+        : `Фильтр ${label}: ${getPersonDisplayLabel(resolved.userId)}.`;
+
+      const updated = await updateVoteAuditModalInteraction(interaction, buildVoteAuditPanelPayload(panel.panelId, { headerText }));
+      if (!updated) {
+        await interaction.reply({ content: headerText, ephemeral: true });
+      }
       return;
     }
 
