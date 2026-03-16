@@ -982,6 +982,21 @@ function sortPeopleForRow(list, rowId) {
   });
 }
 
+function countPeopleWhoRatedOnce() {
+  let count = 0;
+  for (const voterMap of Object.values(db.votes || {})) {
+    let hasAny = false;
+    for (const vote of Object.values(voterMap || {})) {
+      if (normalizeVoteValue(vote?.value)) {
+        hasAny = true;
+        break;
+      }
+    }
+    if (hasAny) count++;
+  }
+  return count;
+}
+
 function buildGraphicBucketsFromPeople() {
   const buckets = Object.fromEntries(BOARD_ROW_ORDER.map((id) => [id, []]));
   for (const person of Object.values(db.people || {})) {
@@ -1632,8 +1647,8 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
         const bandCapacity = Math.max(1, cols * bandRows);
         const groupIndex = Math.floor(idx / bandCapacity);
         const withinGroup = idx % bandCapacity;
-        const col = Math.floor(withinGroup / bandRows);
-        const rowInGroup = withinGroup % bandRows;
+        const rowInGroup = Math.floor(withinGroup / cols);
+        const col = withinGroup % cols;
         x = rightX + col * (rowIcon + gap);
         yy = rightY + groupIndex * (bandRows * rowIcon + bandRows * gap) + rowInGroup * (rowIcon + gap);
       } else {
@@ -2271,7 +2286,7 @@ async function renderGraphicTierlistPng(client = null) {
 
   fillColor(ctx, "#cfcfcf");
   setGraphicFont(ctx, 22, "regular");
-  ctx.fillText(`people: ${entries.length}. stage: 3. updated: ${new Date().toLocaleString("ru-RU")}`, 40, H - 18);
+  ctx.fillText(`people: ${entries.length}. raters: ${countPeopleWhoRatedOnce()}. updated: ${new Date().toLocaleString("ru-RU")}`, 40, H - 18);
 
   let yCursor = topY;
   for (const row of rowLayout) {
@@ -2310,8 +2325,8 @@ async function renderGraphicTierlistPng(client = null) {
         const bandCapacity = Math.max(1, cols * bandRows);
         const groupIndex = Math.floor(idx / bandCapacity);
         const withinGroup = idx % bandCapacity;
-        const col = Math.floor(withinGroup / bandRows);
-        const rowInGroup = withinGroup % bandRows;
+        const rowInGroup = Math.floor(withinGroup / cols);
+        const col = withinGroup % cols;
         x = rightX + col * (rowIcon + gap);
         yy = rightY + groupIndex * (bandRows * rowIcon + bandRows * gap) + rowInGroup * (rowIcon + gap);
       } else {
