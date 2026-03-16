@@ -85,6 +85,8 @@ const DEFAULT_ROW_ICON_SCALES = {
 const RATING_BUTTON_ORDER = ["5", "4", "3", "2", "1", "unknown"];
 const PERSONAL_TIER_ORDER = ["5", "4", "3", "2", "1", "unknown"];
 const SESSION_HISTORY_LIMIT = Math.max(10, Number(process.env.SESSION_HISTORY_LIMIT) || 24);
+const NEW_ROW_EXIT_THRESHOLD = 3;
+const UNKNOWN_ROW_PERCENT_THRESHOLD = 30;
 
 
 const STAGE_PLAN = {
@@ -973,6 +975,8 @@ function sortPeopleForRow(list, rowId) {
       const promotionDemotionCmp = comparePromotionDemotionPriority(av, bv, id);
       if (promotionDemotionCmp) return promotionDemotionCmp;
     } else {
+      if ((bv.total || 0) !== (av.total || 0)) return (bv.total || 0) - (av.total || 0);
+      if ((bv.knownCount || 0) !== (av.knownCount || 0)) return (bv.knownCount || 0) - (av.knownCount || 0);
       const aCreated = String(a.createdAt || "");
       const bCreated = String(b.createdAt || "");
       if (aCreated !== bCreated) return bCreated.localeCompare(aCreated);
@@ -997,6 +1001,23 @@ function countPeopleWhoRatedOnce() {
   return count;
 }
 
+function getRoundedUnknownPercent(aggregate) {
+  return Math.round((Number(aggregate?.unknownShare) || 0) * 100);
+}
+
+function shouldStayInNewRow(aggregate) {
+  return Number(aggregate?.total || 0) < NEW_ROW_EXIT_THRESHOLD;
+}
+
+function shouldAppearInUnknownRow(aggregate) {
+  return Number(aggregate?.unknownCount || 0) > 0 && getRoundedUnknownPercent(aggregate) > UNKNOWN_ROW_PERCENT_THRESHOLD;
+}
+
+function getNewRowBadgeText(aggregate) {
+  const total = Number(aggregate?.total || 0);
+  return total > 0 ? String(total) : "";
+}
+
 function buildGraphicBucketsFromPeople() {
   const buckets = Object.fromEntries(BOARD_ROW_ORDER.map((id) => [id, []]));
   for (const person of Object.values(db.people || {})) {
@@ -1018,8 +1039,16 @@ function buildGraphicBucketsFromPeople() {
       createdAt: person.createdAt || "",
       source: person.source || "manual",
     };
-    if (buckets[primaryRowId]) buckets[primaryRowId].push({ ...baseCard, rowId: primaryRowId });
-    if ((aggregate.unknownCount || 0) > 0) {
+
+    if ((aggregate.total || 0) > 0 && buckets[primaryRowId]) {
+      buckets[primaryRowId].push({ ...baseCard, rowId: primaryRowId });
+    }
+
+    if (shouldStayInNewRow(aggregate)) {
+      buckets.new.push({ ...baseCard, rowId: "new", badgeText: getNewRowBadgeText(aggregate), duplicateOf: primaryRowId });
+    }
+
+    if (shouldAppearInUnknownRow(aggregate)) {
       buckets.unknown.push({ ...baseCard, rowId: "unknown", duplicateOf: primaryRowId });
     }
   }
@@ -1666,6 +1695,7 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
         ctx.fillRect(x, yy, rowIcon, rowIcon);
       }
       drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon);
+      drawGraphicAvatarBadge(ctx, player, x, yy, rowIcon);
     }
   }
 
@@ -1686,43 +1716,36 @@ async function buildMyStatusPayload(client, userId) {
   const remaining = Math.max(0, eligible - given.total);
   const progressPct = eligible ? Math.min(100, Math.round((given.total / eligible) * 100)) : 0;
   const session = db.sessions?.[userId] || null;
-  const activeTarget = session?.activeTargetId ? db.people?.[session.activeTargetId] : null;
-  const lastTarget = session?.lastCompletedTargetId ? db.people?.[session.lastCompletedTargetId] : null;
-  const historyLines = buildSessionHistoryLines(userId, 8);
-  const anonymousComments = getAnonymousCommentsForTarget(userId, 8);
-  const evaluatorWeight = getEvaluatorWeight(userId);
-  const rowInfluence = getEvaluatorRowInfluence(userId);
-  const effectiveInfluence = evaluatorWeight * rowInfluence;
+  const anonymousComments = getAnonymousCommentsForTarget(userId, 12);
+  const roundedUnknownPercent = getRoundedUnknownPercent(received);
 
   const summary = new EmbedBuilder()
     .setTitle("Мой статус")
     .setDescription([
+      `Осталось оценить: **${remaining}** из **${eligible}**.`,
+      `Ты уже оценил: **${given.total}** человек. Готовность: **${progressPct}%**.`,
+      `Из твоих оценок обычных: **${given.known}**. «Не знаю»: **${given.unknown}**.`,
       person
-        ? `Ты в пуле оцениваемых. Текущая обычная строка: **${getRowLabel(rowId)}**. Влияние твоих голосов: **x${effectiveInfluence.toFixed(2)}**.`
+        ? `Твоя текущая строка в общем тир-листе: **${getRowLabel(rowId)}**.`
         : "Тебя ещё нет в пуле оцениваемых. Кнопка «Начать оценку» автоматически добавит тебя.",
-      `Прогресс оценки: **${given.total}/${eligible}**. Осталось: **${remaining}**. Готовность: **${progressPct}%**.`,
-      `Ты выдал обычных оценок: **${given.known}**. Нажатий «Не знаю»: **${given.unknown}**.`,
-      `По тебе: всего голосов **${received.total || 0}**, обычных **${received.knownCount || 0}**, «Не знаю» **${received.unknownCount || 0}**.`,
-      `Текущая средняя по тебе: **${formatAverage(received.average)}**. Базовая средняя: **${formatAverage(received.baseAverage)}**. Bias: **${getTargetBias(userId) >= 0 ? "+" : ""}${getTargetBias(userId).toFixed(2)}**.`,
-      `Дистанция внутри строки: **${formatPromotionDemotionLine(received)}**.`,
-      `Распределение по тебе: **${formatDistributionLine(received.distribution)}**.`,
-      activeTarget ? `Сейчас на очереди: **${activeTarget.username || activeTarget.name || activeTarget.userId}**.` : "Активной карточки сейчас нет.",
-      lastTarget ? `Последний человек: **${lastTarget.username || lastTarget.name || lastTarget.userId}**. Последний выбор: **${session?.lastVoteValue === "unknown" ? "Не знаю" : session?.lastVoteValue || "—"}**.` : null,
-      session?.lastCommittedAt ? `Последнее слияние в общий тир-лист: **${session.lastCommittedAt}**.` : null,
-      session?.replaceCommitted ? `Идёт полная переоценка. Старый общий тир-лист по твоим голосам пока сохранён и заменится только после завершения нового.` : null,
-      session?.stoppedAt ? `Оценивание сейчас остановлено. Прогресс и черновик сохранены.` : null,
-      effectiveInfluence !== 1 ? `Коэффициент повышен через настройки. Базово у всех **x1**.` : `Базово у всех влияние **x1**. Повышение возможно только командами настройки коэффициентов.`,
+      `Тебя оценили: **${received.total || 0}** раз. Обычных оценок: **${received.knownCount || 0}**. «Не знаю»: **${received.unknownCount || 0}**.`,
+      `Твоя средняя оценка сейчас: **${formatAverage(received.average)}**.`,
+      `По кнопке «Не знаю» у тебя сейчас: **${roundedUnknownPercent}%**.${roundedUnknownPercent > UNKNOWN_ROW_PERCENT_THRESHOLD ? " Поэтому ты есть и в строке «Не знают»." : ""}`,
+      `Распределение голосов по тебе: **${formatDistributionLine(received.distribution)}**.`,
+      session?.replaceCommitted ? "Сейчас у тебя идёт полная переоценка. Старый вклад в общий тир-лист сохранён, пока ты не закончишь новый личный тир-лист." : null,
+      session?.lastCommittedAt ? "Твой последний личный тир-лист уже был слит в общий." : null,
     ].filter(Boolean).join("\n"));
 
-  const details = new EmbedBuilder()
-    .setTitle("Подробности")
-    .addFields(
-      { name: "История сессии", value: historyLines.length ? historyLines.join("\n") : "Пока пусто.", inline: false },
-      { name: "Анонимные комментарии обо мне", value: anonymousComments.length ? anonymousComments.map((item, i) => `**${i + 1}.** ${item.text}`).join("\n\n") : "Пока нет.", inline: false },
+  const commentsEmbed = new EmbedBuilder()
+    .setTitle("Анонимные комментарии обо мне")
+    .setDescription(
+      anonymousComments.length
+        ? anonymousComments.map((item, i) => `**${i + 1}.** ${item.text}`).join("\n\n")
+        : "Пока никто не оставлял тебе анонимных комментариев."
     );
 
   const payload = {
-    embeds: [summary, details],
+    embeds: [summary, commentsEmbed],
     components: [new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
@@ -1777,21 +1800,25 @@ function buildNoTargetsPayload(userId, options = {}) {
   const desc = [
     options.reason === "no-people"
       ? "Пока в пуле нет других людей для оценки."
-      : "У тебя пока нет новых людей без оценки.",
+      : "Оценка пока завершена. Новых людей без твоей оценки сейчас нет.",
     `Ты уже раздал голосов: **${given.total}**.`,
-    options.merged ? `Личный тир-лист слит в общий. Комментариев слито: **${options.merged.committedComments || 0}**. Голосов слито: **${options.merged.committedVotes || 0}**.${options.merged.replacedOldVotes ? ` Старый вклад заменён: **${options.merged.replacedOldVotes}** голосов.` : ""}` : null,
-    "Когда модеры добавят новых людей или появятся новые аккаунты в пуле, кнопка «Начать оценку» снова даст карточку.",
+    options.merged ? `Новый личный тир-лист слит в общий. Комментариев слито: **${options.merged.committedComments || 0}**. Голосов слито: **${options.merged.committedVotes || 0}**.${options.merged.replacedOldVotes ? ` Старый вклад заменён: **${options.merged.replacedOldVotes}** голосов.` : ""}` : null,
+    "Это сообщение исчезнет само через 10 секунд.",
   ].filter(Boolean).join("\n");
 
   return {
     embeds: [new EmbedBuilder().setTitle("Оценка завершена").setDescription(desc)],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("rate_my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
-    )],
+    components: [],
     ephemeral: true,
+    autoDeleteMs: 10000,
   };
+}
+
+function scheduleEphemeralDelete(interaction, ms = 10000) {
+  const delay = Math.max(1000, Number(ms) || 10000);
+  setTimeout(() => {
+    interaction.deleteReply().catch(() => {});
+  }, delay);
 }
 
 async function buildRatingCardPayload(client, userId, session, options = {}) {
@@ -1813,9 +1840,8 @@ async function buildRatingCardPayload(client, userId, session, options = {}) {
       buildSessionProgressLine(userId),
       session?.replaceCommitted ? "Сейчас идёт полная переоценка. Старые голоса пока остаются в общем тир-листе до завершения нового." : null,
       `У него уже есть голосов: **${agg.total || 0}**. Обычных: **${agg.knownCount || 0}**. «Не знаю»: **${agg.unknownCount || 0}**.`,
-      `Средняя: **${formatAverage(agg.average)}**. Общая строка: **${getRowLabel(getBoardRowForPerson(person))}**.`,
-      `Дистанция внутри строки: **${formatPromotionDemotionLine(agg)}**.`,
-      `Распределение: **${distributionLine}**.`,
+      `Средняя: **${formatAverage(agg.average)}**. Текущая строка: **${getRowLabel(getBoardRowForPerson(person))}**.`,
+      `Распределение голосов по нему: **${distributionLine}**.`,
       existingComment?.text ? `Твой анонимный комментарий к нему уже есть. Длина: **${existingComment.text.length}**.` : "Анонимный комментарий пока не оставлен.",
       options.lastActionText || null,
     ].filter(Boolean).join("\n"));
@@ -2098,6 +2124,22 @@ function drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon) {
   }
 }
 
+function drawGraphicAvatarBadge(ctx, player, x, yy, rowIcon) {
+  const badgeText = String(player?.badgeText || "").trim();
+  if (!badgeText) return;
+  const badgeW = Math.max(18, Math.floor(rowIcon * 0.24));
+  const badgeH = Math.max(16, Math.floor(rowIcon * 0.2));
+  const bx = x + rowIcon - badgeW - 4;
+  const by = yy + Math.max(6, Math.floor(rowIcon * 0.28));
+  ctx.fillStyle = "rgba(0,0,0,0.82)";
+  ctx.fillRect(bx, by, badgeW, badgeH);
+  const fit = fitGraphicSingleLineText(ctx, badgeText, "bold", badgeW - 4, Math.max(9, Math.floor(badgeH * 0.8)), 8);
+  setGraphicFont(ctx, fit.px, "bold");
+  ctx.fillStyle = "rgba(255,255,255,0.98)";
+  const textY = by + Math.max(10, Math.floor((badgeH + fit.px) / 2) - 2);
+  ctx.fillText(fit.text, centerGraphicTextX(ctx, fit.text, bx, badgeW), textY);
+}
+
 function drawGraphicTierTitle(ctx, text, boxX, boxY, boxW, boxH) {
   const fit = fitGraphicWrappedText(ctx, text, "bold", boxW, boxH, 56, 22, 3);
   fillColor(ctx, "#111111");
@@ -2360,6 +2402,7 @@ async function renderGraphicTierlistPng(client = null) {
       }
 
       drawGraphicAvatarNameplates(ctx, player, x, yy, rowIcon);
+      drawGraphicAvatarBadge(ctx, player, x, yy, rowIcon);
 
     }
   }
@@ -2925,9 +2968,11 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
       const res = await upsertPersonFromUser(client, interaction.user, { source: "self-start" });
       const session = resumeRatingSession(interaction.user.id);
-      await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, session, {
+      const payload = await buildRatingCardPayload(client, interaction.user.id, session, {
         headerText: buildStartRatingText(res.created, session),
-      }));
+      });
+      await interaction.editReply(payload);
+      if (payload.autoDeleteMs) scheduleEphemeralDelete(interaction, payload.autoDeleteMs);
       void scheduleGraphicTierlistRefresh(client);
       return;
     }
@@ -3002,7 +3047,7 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, result.session, {
+      const payload = await buildRatingCardPayload(client, interaction.user.id, result.session, {
         headerText: result.committed
           ? (result.committed.replacedOldVotes || result.committed.replacedOldComments
               ? "Голос сохранён. Новый личный тир-лист закончен и заменил твой старый вклад в общем тир-листе."
@@ -3010,7 +3055,9 @@ client.on("interactionCreate", async (interaction) => {
           : "Голос сохранён в личный тир-лист.",
         lastActionText: `Последний выбор: **${result.written.vote.value === "unknown" ? "Не знаю" : result.written.vote.value}** для **${db.people?.[result.targetId]?.username || db.people?.[result.targetId]?.name || result.targetId}**.${result.committed ? ` Слитых голосов: ${result.committed.committedVotes || 0}.` : ""}${result.committed?.replacedOldVotes ? ` Заменено старых голосов: ${result.committed.replacedOldVotes}.` : ""}`,
         merged: result.committed || null,
-      }));
+      });
+      await interaction.editReply(payload);
+      if (payload.autoDeleteMs) scheduleEphemeralDelete(interaction, payload.autoDeleteMs);
       if (result.committed) void scheduleGraphicTierlistRefresh(client);
       return;
     }
