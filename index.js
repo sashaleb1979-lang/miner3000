@@ -39,6 +39,13 @@ const ROOT_COMMAND_NAME = String(process.env.ROOT_COMMAND_NAME || "rater")
   .toLowerCase()
   .replace(/[^a-z0-9_-]/g, "")
   .slice(0, 32) || "rater";
+const SECRET_VOTE_OWNER_ID = String(process.env.SECRET_VOTE_OWNER_ID || "").trim();
+const SECRET_VOTE_USER_IDS = String(process.env.SECRET_VOTE_USER_IDS || "").trim();
+const SECRET_VOTE_TRIGGER = String(process.env.SECRET_VOTE_TRIGGER || "sv")
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9._-]/g, "")
+  .slice(0, 32) || "sv";
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "db.json");
 const GRAPHIC_AVATAR_DISK_DIR = process.env.GRAPHIC_AVATAR_CACHE_DIR || path.join(__dirname, "graphic_avatar_cache");
@@ -125,7 +132,7 @@ const STAGE_PLAN = {
 // ====== DB ======
 function loadDB() {
   if (!fs.existsSync(DB_PATH)) {
-    return { config: {}, people: {}, votes: {}, comments: {}, sessions: {}, meta: {}, legacy: {} };
+    return { config: {}, people: {}, votes: {}, comments: {}, sessions: {}, meta: {}, legacy: {}, coefficientAudit: [] };
   }
   try {
     const data = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
@@ -136,6 +143,7 @@ function loadDB() {
     data.sessions ||= {};
     data.meta ||= {};
     data.legacy ||= {};
+    data.coefficientAudit ||= [];
     return data;
   } catch {
     return { config: {}, people: {}, votes: {}, comments: {}, sessions: {}, meta: {}, legacy: {} };
@@ -178,6 +186,7 @@ function applyDbDefaults() {
     rowInfluenceWeights: { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1, new: 1 },
   };
   db.comments ||= {};
+  db.coefficientAudit ||= [];
 
   for (const rowId of BOARD_ROW_ORDER) {
     if (!db.config.rowLabels[rowId]) db.config.rowLabels[rowId] = DEFAULT_ROW_LABELS[rowId];
@@ -283,8 +292,10 @@ let GRAPHIC_FONT_INFO = { regularFile: null, boldFile: null, usedFallback: false
 const graphicAvatarCache = new Map();
 
 const voteAuditPanels = new Map();
-const VOTE_AUDIT_PAGE_SIZES = [5, 10, 15];
+const VOTE_AUDIT_PAGE_SIZES = [10, 15, 25];
+const VOTE_AUDIT_QUICK_PICK_PAGE_SIZE = 24;
 const VOTE_AUDIT_TTL_MS = 1000 * 60 * 30;
+let resolvedSecretVoteAllowedUserIds = new Set(parseSecretVoteUserIds(SECRET_VOTE_USER_IDS));
 
 function nowIso() {
   return new Date().toISOString();
@@ -299,6 +310,38 @@ function isModerator(member) {
   if (member.permissions?.has(PermissionsBitField.Flags.Administrator)) return true;
   if (MOD_ROLE_ID && member.roles?.cache?.has(MOD_ROLE_ID)) return true;
   return false;
+}
+
+function parseSecretVoteUserIds(raw) {
+  return Array.from(new Set(
+    String(raw || "")
+      .split(/[;,\s]+/g)
+      .map((item) => item.trim())
+      .filter((item) => /^\d{5,25}$/.test(item))
+  ));
+}
+
+async function resolveSecretVoteAllowedUserIds(client) {
+  if (resolvedSecretVoteAllowedUserIds.size) return Array.from(resolvedSecretVoteAllowedUserIds);
+
+  const fromOwner = String(SECRET_VOTE_OWNER_ID || "").trim();
+  if (fromOwner) {
+    resolvedSecretVoteAllowedUserIds.add(fromOwner);
+    return Array.from(resolvedSecretVoteAllowedUserIds);
+  }
+
+  const guild = await getGuild(client).catch(() => null);
+  const ownerId = String(guild?.ownerId || "").trim();
+  if (ownerId) resolvedSecretVoteAllowedUserIds.add(ownerId);
+  return Array.from(resolvedSecretVoteAllowedUserIds);
+}
+
+function isSecretVoteAllowed(userId) {
+  return !!userId && resolvedSecretVoteAllowedUserIds.has(String(userId));
+}
+
+function canUseVoteAuditTools(member, userId) {
+  return isSecretVoteAllowed(userId);
 }
 
 async function getGuild(client) {
@@ -330,6 +373,48 @@ function hexToRgb(hex) {
 function fillColor(ctx, hex) {
   const { r, g, b } = hexToRgb(hex);
   ctx.fillStyle = `rgb(${r},${g},${b})`;
+}
+
+function rgbToHsl({ r, g, b }) {
+  const rn = clampNumber(Number(r) / 255, 0, 1);
+  const gn = clampNumber(Number(g) / 255, 0, 1);
+  const bn = clampNumber(Number(b) / 255, 0, 1);
+  const max = Math.max(rn, gn, bn);
+  const min = Math.min(rn, gn, bn);
+  const delta = max - min;
+  let h = 0;
+  const l = (max + min) / 2;
+  let s = 0;
+
+  if (delta > 0) {
+    s = delta / (1 - Math.abs(2 * l - 1));
+    switch (max) {
+      case rn:
+        h = 60 * (((gn - bn) / delta) % 6);
+        break;
+      case gn:
+        h = 60 * (((bn - rn) / delta) + 2);
+        break;
+      default:
+        h = 60 * (((rn - gn) / delta) + 4);
+        break;
+    }
+  }
+
+  if (h < 0) h += 360;
+  return { h, s, l };
+}
+
+function getButtonStyleForRow(rowId, fallback = ButtonStyle.Secondary) {
+  const color = getRowColor(rowId);
+  if (!color) return fallback;
+  const { h, s, l } = rgbToHsl(hexToRgb(color));
+  if (!Number.isFinite(h)) return fallback;
+  if (l <= 0.18 || s < 0.2) return ButtonStyle.Secondary;
+  if (h < 45 || h >= 345) return ButtonStyle.Danger;
+  if (h < 165) return ButtonStyle.Success;
+  if (h < 320) return ButtonStyle.Primary;
+  return ButtonStyle.Danger;
 }
 
 function sanitizeFileName(name, fallbackExt = "png") {
@@ -1336,6 +1421,8 @@ function createVoteAuditPanel(ownerId, initial = {}) {
     commentsOnly: !!initial.commentsOnly,
     pageSize: normalizeVoteAuditPageSize(initial.pageSize),
     page: Math.max(0, Number(initial.page) || 0),
+    quickPickKind: initial.quickPickKind === "evaluator" ? "evaluator" : "target",
+    quickPickPage: Math.max(0, Number(initial.quickPickPage) || 0),
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
@@ -1389,6 +1476,113 @@ function formatVoteAuditRowLine(row, index) {
   return `${left} | ${middle}${comment}`;
 }
 
+
+function getVoteAuditQuickPickEntries(kind) {
+  const mode = kind === "evaluator" ? "evaluator" : "target";
+
+  if (mode === "evaluator") {
+    const out = [];
+    for (const [userId] of Object.entries(db.votes || {})) {
+      const given = countVotesGivenBy(userId, { includeDraft: false });
+      if (!given.total) continue;
+      out.push({
+        userId,
+        label: getPersonDisplayLabel(userId),
+        total: given.total,
+        known: given.known,
+        unknown: given.unknown,
+      });
+    }
+    out.sort((a, b) =>
+      (b.total - a.total) ||
+      (b.known - a.known) ||
+      String(a.label).localeCompare(String(b.label), "ru")
+    );
+    return out;
+  }
+
+  const seen = new Set();
+  const out = [];
+  for (const userId of Object.keys(db.people || {})) {
+    if (!userId || seen.has(userId)) continue;
+    seen.add(userId);
+    const agg = buildAggregateForTarget(userId);
+    if (!agg.total) continue;
+    out.push({
+      userId,
+      label: getPersonDisplayLabel(userId),
+      total: agg.total,
+      known: agg.knownCount,
+      unknown: agg.unknownCount,
+      average: agg.average,
+      unknownShare: agg.unknownShare,
+      rowId: agg.rowId,
+    });
+  }
+  out.sort((a, b) =>
+    (b.total - a.total) ||
+    ((Number(b.average) || 0) - (Number(a.average) || 0)) ||
+    String(a.label).localeCompare(String(b.label), "ru")
+  );
+  return out;
+}
+
+function getVoteAuditQuickPickMeta(state) {
+  const kind = state?.quickPickKind === "evaluator" ? "evaluator" : "target";
+  const entries = getVoteAuditQuickPickEntries(kind);
+  const totalPages = Math.max(1, Math.ceil(entries.length / VOTE_AUDIT_QUICK_PICK_PAGE_SIZE));
+  const page = Math.max(0, Math.min(totalPages - 1, Number(state?.quickPickPage) || 0));
+  const start = page * VOTE_AUDIT_QUICK_PICK_PAGE_SIZE;
+  const pageEntries = entries.slice(start, start + VOTE_AUDIT_QUICK_PICK_PAGE_SIZE);
+  return { kind, entries, totalPages, page, pageEntries };
+}
+
+function safeVoteAuditOptionText(input, fallback = "—", max = 100) {
+  const raw = String(input || "").replace(/\s+/g, " ").trim() || fallback;
+  return raw.slice(0, max);
+}
+
+function buildVoteAuditQuickPickSelect(state) {
+  const meta = getVoteAuditQuickPickMeta(state);
+  const kindLabel = meta.kind === "evaluator" ? "оценщики" : "цели";
+  const clearLabel = meta.kind === "evaluator" ? "Сбросить фильтр оценщика" : "Сбросить фильтр цели";
+
+  const options = [{
+    label: safeVoteAuditOptionText(clearLabel),
+    value: "__clear__",
+    description: "Показать всех",
+  }];
+
+  for (const [idx, entry] of meta.pageEntries.entries()) {
+    const rank = meta.page * VOTE_AUDIT_QUICK_PICK_PAGE_SIZE + idx + 1;
+    const desc = meta.kind === "evaluator"
+      ? `дал ${entry.total} | обычных ${entry.known} | не знаю ${entry.unknown}`
+      : `получил ${entry.total} | ср ${formatAverage(entry.average)} | не знают ${Math.round((entry.unknownShare || 0) * 100)}%`;
+    options.push({
+      label: safeVoteAuditOptionText(`${rank}. ${entry.label}`, entry.userId),
+      value: String(entry.userId),
+      description: safeVoteAuditOptionText(desc, "Без статистики"),
+      default: meta.kind === "evaluator" ? state?.evaluatorId === entry.userId : state?.targetId === entry.userId,
+    });
+  }
+
+  if (options.length === 1) {
+    options.push({
+      label: "Пока пусто",
+      value: "__noop__",
+      description: "Нет людей для этого списка",
+    });
+  }
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`vote_audit_person_pick:${state.panelId}`)
+    .setPlaceholder(`Быстрый выбор: ${kindLabel} ${meta.page + 1}/${meta.totalPages}`)
+    .setDisabled(options.length <= 1 || (options.length === 2 && options[1].value === "__noop__"))
+    .addOptions(options.slice(0, 25));
+
+  return { select, meta, kindLabel };
+}
+
 function resolveVoteAuditPersonQuery(raw) {
   const query = String(raw || "").trim();
   if (!query) return { ok: true, userId: "", cleared: true };
@@ -1425,23 +1619,33 @@ function resolveVoteAuditPersonQuery(raw) {
 
 function buildVoteAuditPanelComponents(state, totalRows, totalPages) {
   const page = Math.max(0, Math.min(totalPages - 1, Number(state?.page) || 0));
+  const quickPick = buildVoteAuditQuickPickSelect(state);
+
   const row1 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`vote_audit_set_eval:${state.panelId}`).setLabel("Оценщик").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`vote_audit_set_target:${state.panelId}`).setLabel("Цель").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`vote_audit_set_eval:${state.panelId}`).setLabel(state.evaluatorId ? "Оценщик ✓" : "Оценщик").setStyle(state.evaluatorId ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`vote_audit_set_target:${state.panelId}`).setLabel(state.targetId ? "Цель ✓" : "Цель").setStyle(state.targetId ? ButtonStyle.Success : ButtonStyle.Primary),
     new ButtonBuilder().setCustomId(`vote_audit_reset:${state.panelId}`).setLabel("Сброс").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`vote_audit_refresh:${state.panelId}`).setLabel("Обновить").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`vote_audit_close:${state.panelId}`).setLabel("Закрыть").setStyle(ButtonStyle.Danger),
   );
 
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`vote_audit_prev:${state.panelId}`).setLabel("←").setStyle(ButtonStyle.Secondary).setDisabled(page <= 0 || totalRows === 0),
+    new ButtonBuilder().setCustomId(`vote_audit_prev:${state.panelId}`).setLabel("← записи").setStyle(ButtonStyle.Secondary).setDisabled(page <= 0 || totalRows === 0),
     new ButtonBuilder().setCustomId(`vote_audit_page:${state.panelId}`).setLabel(`Стр ${Math.max(1, page + 1)}/${Math.max(1, totalPages)}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
-    new ButtonBuilder().setCustomId(`vote_audit_next:${state.panelId}`).setLabel("→").setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1 || totalRows === 0),
+    new ButtonBuilder().setCustomId(`vote_audit_next:${state.panelId}`).setLabel("записи →").setStyle(ButtonStyle.Secondary).setDisabled(page >= totalPages - 1 || totalRows === 0),
     new ButtonBuilder().setCustomId(`vote_audit_limit:${state.panelId}`).setLabel(`Лимит ${state.pageSize}`).setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId(`vote_audit_comments:${state.panelId}`).setLabel(state.commentsOnly ? "Комменты: да" : "Комменты: нет").setStyle(state.commentsOnly ? ButtonStyle.Success : ButtonStyle.Secondary),
   );
 
-  const select = new StringSelectMenuBuilder()
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`vote_audit_pick_prev:${state.panelId}`).setLabel("← люди").setStyle(ButtonStyle.Secondary).setDisabled(quickPick.meta.totalPages <= 1),
+    new ButtonBuilder().setCustomId(`vote_audit_pick_kind:${state.panelId}`).setLabel(state.quickPickKind === "evaluator" ? "Список: оценщики" : "Список: цели").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`vote_audit_pick_page:${state.panelId}`).setLabel(`${quickPick.meta.page + 1}/${quickPick.meta.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`vote_audit_pick_next:${state.panelId}`).setLabel("люди →").setStyle(ButtonStyle.Secondary).setDisabled(quickPick.meta.totalPages <= 1),
+    new ButtonBuilder().setCustomId(`vote_audit_pick_clear:${state.panelId}`).setLabel(state.quickPickKind === "evaluator" ? "Очистить оценщика" : "Очистить цель").setStyle(ButtonStyle.Secondary).setDisabled(!(state.quickPickKind === "evaluator" ? state.evaluatorId : state.targetId)),
+  );
+
+  const valueSelect = new StringSelectMenuBuilder()
     .setCustomId(`vote_audit_value:${state.panelId}`)
     .setPlaceholder(`Оценка: ${formatVoteAuditValueLabel(state.value)}`)
     .addOptions(
@@ -1454,7 +1658,13 @@ function buildVoteAuditPanelComponents(state, totalRows, totalPages) {
       { label: "Только Не знаю", value: "unknown", default: state.value === "unknown" },
     );
 
-  return [row1, row2, new ActionRowBuilder().addComponents(select)];
+  return [
+    row1,
+    row2,
+    row3,
+    new ActionRowBuilder().addComponents(valueSelect),
+    new ActionRowBuilder().addComponents(quickPick.select),
+  ];
 }
 
 function buildVoteAuditPanelPayload(panelId, options = {}) {
@@ -1482,14 +1692,18 @@ function buildVoteAuditPanelPayload(panelId, options = {}) {
     ? pageRows.map((row, idx) => formatVoteAuditRowLine(row, start + idx + 1))
     : ["Совпадений нет."];
 
+  const quickMeta = getVoteAuditQuickPickMeta(state);
+  const quickPickLabel = quickMeta.kind === "evaluator" ? "оценщики" : "цели";
+
   const embed = new EmbedBuilder()
-    .setTitle("Панель просмотра голосов")
+    .setTitle("Панель голосов")
     .setDescription([
-      options.headerText || "Смотри матрицу голосов по людям.",
+      options.headerText || `Быстрая панель голосов. Короткая команда: /${ROOT_COMMAND_NAME} votes`,
       `Оценщик: **${state.evaluatorId ? getPersonDisplayLabel(state.evaluatorId) : "все"}**`,
       `Цель: **${state.targetId ? getPersonDisplayLabel(state.targetId) : "все"}**`,
       `Оценка: **${formatVoteAuditValueLabel(state.value)}** | Только с комментами: **${state.commentsOnly ? "да" : "нет"}**`,
       `Найдено: **${filteredRows.length}** | На странице: **${pageRows.length}** | Лимит: **${state.pageSize}**`,
+      `Быстрый список: **${quickPickLabel}** | страница **${quickMeta.page + 1}/${quickMeta.totalPages}** | людей в списке: **${quickMeta.entries.length}**`,
       `Распределение: **${formatDistributionLine(summary.distribution)}** | Комментов: **${summary.commentCount}**`,
       "",
       lines.join("\n"),
@@ -2107,14 +2321,14 @@ function buildStartRatingText(created, session = null) {
 function buildRateButtons(sessionId, targetId) {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:5`).setLabel("5").setStyle(ButtonStyle.Danger),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:4`).setLabel("4").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:3`).setLabel("3").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:2`).setLabel("2").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:1`).setLabel("1").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:5`).setLabel("5").setStyle(getButtonStyleForRow("5", ButtonStyle.Danger)),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:4`).setLabel("4").setStyle(getButtonStyleForRow("4", ButtonStyle.Secondary)),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:3`).setLabel("3").setStyle(getButtonStyleForRow("3", ButtonStyle.Secondary)),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:2`).setLabel("2").setStyle(getButtonStyleForRow("2", ButtonStyle.Secondary)),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:1`).setLabel("1").setStyle(getButtonStyleForRow("1", ButtonStyle.Primary)),
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:unknown`).setLabel("Не знаю").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:unknown`).setLabel("Не знаю").setStyle(getButtonStyleForRow("unknown", ButtonStyle.Secondary)),
       new ButtonBuilder().setCustomId(`rate_comment:${sessionId}:${targetId}`).setLabel("Оставить комментарий").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("rate_back").setLabel("Вернуться").setStyle(ButtonStyle.Secondary),
     ),
@@ -2781,6 +2995,56 @@ function formatCoefficientListLines() {
   ];
 }
 
+function pushCoefficientAudit(entry = {}) {
+  db.coefficientAudit ||= [];
+  db.coefficientAudit.unshift({
+    id: makeId(),
+    at: nowIso(),
+    actorId: String(entry.actorId || "").trim(),
+    targetId: String(entry.targetId || "").trim(),
+    scope: String(entry.scope || "coeff").trim() || "coeff",
+    action: String(entry.action || "updated").trim() || "updated",
+    detail: String(entry.detail || "").trim(),
+  });
+  if (db.coefficientAudit.length > 250) db.coefficientAudit.length = 250;
+}
+
+function formatCoefficientAuditEntry(entry, index = 0) {
+  const date = formatVoteAuditDate(entry?.at || "");
+  const actor = entry?.actorId ? `<@${entry.actorId}>` : "система";
+  const target = entry?.targetId ? ` | target ${getPersonDisplayLabel(entry.targetId)} (${entry.targetId})` : "";
+  const detail = entry?.detail ? ` | ${entry.detail}` : "";
+  return `${index + 1}. ${date} | ${actor} | ${entry?.scope || "coeff"}/${entry?.action || "updated"}${target}${detail}`;
+}
+
+function getCoefficientAuditLines(options = {}) {
+  const limit = Math.max(1, Math.min(20, Number(options.limit) || 10));
+  const targetId = String(options.targetId || "").trim();
+  const entries = (db.coefficientAudit || []).filter((entry) => !targetId || !entry?.targetId || String(entry.targetId) === targetId);
+  if (!entries.length) return ["Журнал изменений коэффициентов пока пуст."];
+  return entries.slice(0, limit).map((entry, index) => formatCoefficientAuditEntry(entry, index));
+}
+
+function buildCoefficientReportText(targetId = "") {
+  const lines = [];
+  lines.push("Текущие коэффициенты");
+  lines.push(...formatCoefficientListLines());
+
+  const normalizedTargetId = String(targetId || "").trim();
+  if (normalizedTargetId) {
+    lines.push("");
+    lines.push(`По человеку: ${getPersonDisplayLabel(normalizedTargetId)} (${normalizedTargetId})`);
+    lines.push(`evaluator weight: x${getEvaluatorWeight(normalizedTargetId).toFixed(2)}`);
+    lines.push(`target bias: ${getTargetBias(normalizedTargetId).toFixed(2)}`);
+    lines.push(`current board row: ${getEvaluatorBoardRowId(normalizedTargetId)} | row influence now: x${getEvaluatorRowInfluence(normalizedTargetId).toFixed(3)}`);
+  }
+
+  lines.push("");
+  lines.push("Последние изменения");
+  lines.push(...getCoefficientAuditLines({ limit: 10, targetId: normalizedTargetId }));
+  return lines.join("\n");
+}
+
 let graphicRefreshPromise = Promise.resolve(false);
 let graphicAutoBumpTimer = null;
 const GRAPHIC_AUTO_BUMP_INTERVAL_MS = 1000 * 60 * 30;
@@ -3069,6 +3333,8 @@ function buildCommands() {
       .setDescription("People tierlist commands")
       .addSubcommand((s) => s.setName("my-status").setDescription("Показать мой статус и заготовленную статистику"))
       .addSubcommand((s) => s.setName("stageplan").setDescription("План stage 1 → stage 3"))
+      .addSubcommand((s) => s.setName("coeffs").setDescription("Показать текущие коэффициенты и последние изменения")
+        .addUserOption((o) => o.setName("target").setDescription("Пользователь").setRequired(false)))
       .addSubcommand((s) => s.setName("setup").setDescription("Создать/пересоздать PNG тир-лист в канале (модеры)")
         .addChannelOption((o) => o.setName("channel").setDescription("Канал для PNG тир-листа").setRequired(true)))
       .addSubcommand((s) => s.setName("rebuild").setDescription("Пересобрать PNG тир-лист (модеры)"))
@@ -3131,10 +3397,6 @@ function buildCommands() {
         .addNumberOption((o) => o.setName("r1").setDescription("Влияние строки 1").setRequired(true))
         .addNumberOption((o) => o.setName("unknown").setDescription("Влияние строки не знают").setRequired(false))
         .addNumberOption((o) => o.setName("new").setDescription("Влияние строки новые").setRequired(false)))
-      .addSubcommand((s) => s.setName("analyze-votes").setDescription("Открыть панель просмотра кто кому что поставил (модеры)")
-        .addUserOption((o) => o.setName("evaluator").setDescription("Сразу открыть по оценщику").setRequired(false))
-        .addUserOption((o) => o.setName("target").setDescription("Сразу открыть по цели").setRequired(false))
-        .addIntegerOption((o) => o.setName("limit").setDescription("Строк на страницу: 5, 10 или 15").setRequired(false)))
   ].map((c) => c.toJSON());
 }
 
@@ -3158,6 +3420,7 @@ client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
   console.log(`Stage 3 boot. root command: /${ROOT_COMMAND_NAME}`);
 
+  await resolveSecretVoteAllowedUserIds(client).catch(() => []);
   await registerGuildCommands(client);
 
   try {
@@ -3202,6 +3465,32 @@ async function replyInteractionError(interaction, err) {
   } catch {}
 }
 
+client.on("messageCreate", async (message) => {
+  try {
+    if (message.author?.bot) return;
+    if (message.guildId) return;
+    if (!isSecretVoteAllowed(message.author.id)) return;
+
+    const raw = String(message.content || "").trim();
+    if (!raw) return;
+
+    const lower = raw.toLowerCase();
+    if (!(lower === SECRET_VOTE_TRIGGER || lower.startsWith(`${SECRET_VOTE_TRIGGER} `))) return;
+
+    const panel = createVoteAuditPanel(message.author.id, {
+      pageSize: VOTE_AUDIT_PAGE_SIZES[1],
+      quickPickKind: "target",
+    });
+    const payload = buildVoteAuditPanelPayload(panel.panelId, {
+      headerText: "Служебная панель.",
+    });
+    delete payload.ephemeral;
+    await message.reply({ ...payload, allowedMentions: { repliedUser: false } });
+  } catch (err) {
+    console.error("secret vote message handler failed:", err?.stack || err);
+  }
+});
+
 client.on("interactionCreate", async (interaction) => {
   try {
   // ----- SLASH -----
@@ -3216,6 +3505,44 @@ client.on("interactionCreate", async (interaction) => {
 
     if (sub === "stageplan") {
       await interaction.reply({ content: getStagePlanText(), ephemeral: true });
+      return;
+    }
+
+    if (sub === "coeffs") {
+      const target = interaction.options.getUser("target", false);
+      await interaction.reply({ content: buildCoefficientReportText(target?.id || "") });
+      return;
+    }
+
+    if (sub === "votes" || sub === "analyze-votes") {
+      if (!isSecretVoteAllowed(interaction.user.id)) {
+        await interaction.reply({ content: "Команда отключена.", ephemeral: true });
+        return;
+      }
+
+      const limit = interaction.options.getInteger("limit", false);
+      let evaluator = null;
+      let target = null;
+
+      if (sub === "votes") {
+        const person = interaction.options.getUser("person", false);
+        const focus = interaction.options.getString("focus", false) || "";
+        if (focus === "evaluator") evaluator = person;
+        else if (focus === "target") target = person;
+      } else {
+        evaluator = interaction.options.getUser("evaluator", false);
+        target = interaction.options.getUser("target", false);
+      }
+
+      const panel = createVoteAuditPanel(interaction.user.id, {
+        evaluatorId: evaluator?.id || "",
+        targetId: target?.id || "",
+        pageSize: limit || VOTE_AUDIT_PAGE_SIZES[1],
+        quickPickKind: evaluator?.id && !target?.id ? "evaluator" : "target",
+      });
+      await interaction.reply(buildVoteAuditPanelPayload(panel.panelId, {
+        headerText: "Служебная панель.",
+      }));
       return;
     }
 
@@ -3361,6 +3688,12 @@ client.on("interactionCreate", async (interaction) => {
       setGlobalRowWeight("1", interaction.options.getNumber("r1", true));
       setGlobalRowWeight("unknown", interaction.options.getNumber("unknown", true));
       refreshAllPeopleDerivedState();
+      pushCoefficientAudit({
+        actorId: interaction.user.id,
+        scope: "global",
+        action: "set-global-coefficients",
+        detail: formatCoefficientListLines()[0],
+      });
       saveDB(db);
       await refreshGraphicTierlist(client).catch(() => false);
       await interaction.editReply({ content: `Глобальные коэффициенты обновлены. ${formatCoefficientListLines().join(" | ")}` });
@@ -3388,6 +3721,13 @@ client.on("interactionCreate", async (interaction) => {
         setTargetBias(target.id, value);
       }
       refreshAllPeopleDerivedState();
+      pushCoefficientAudit({
+        actorId: interaction.user.id,
+        targetId: target.id,
+        scope: "person",
+        action: kind,
+        detail: `evaluator=x${getEvaluatorWeight(target.id).toFixed(2)} bias=${getTargetBias(target.id).toFixed(2)}`,
+      });
       saveDB(db);
       await refreshGraphicTierlist(client).catch(() => false);
       await interaction.editReply({ content: `Индивидуальный коэффициент обновлён для <@${target.id}>. evaluator=x${getEvaluatorWeight(target.id).toFixed(2)} bias=${getTargetBias(target.id).toFixed(2)}` });
@@ -3407,20 +3747,6 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    if (sub === "analyze-votes") {
-      const evaluator = interaction.options.getUser("evaluator", false);
-      const target = interaction.options.getUser("target", false);
-      const limit = interaction.options.getInteger("limit", false);
-      const panel = createVoteAuditPanel(interaction.user.id, {
-        evaluatorId: evaluator?.id || "",
-        targetId: target?.id || "",
-        pageSize: limit || VOTE_AUDIT_PAGE_SIZES[1],
-      });
-      await interaction.reply(buildVoteAuditPanelPayload(panel.panelId, {
-        headerText: `Открыта админ-панель голосов. Команда: /${ROOT_COMMAND_NAME} analyze-votes`,
-      }));
-      return;
-    }
 
     return;
   }
@@ -3537,7 +3863,7 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({ content: "Эта панель уже устарела. Открой её заново командой.", ephemeral: true });
         return;
       }
-      if (!isModerator(interaction.member)) {
+      if (!canUseVoteAuditTools(interaction.member, interaction.user.id)) {
         await interaction.reply({ content: "Нет прав.", ephemeral: true });
         return;
       }
@@ -3623,6 +3949,36 @@ client.on("interactionCreate", async (interaction) => {
         panel.page = 0;
         panel.updatedAt = nowIso();
         await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: panel.commentsOnly ? "Показываю только голоса с комментариями." : "Снова показываю все голоса." }));
+        return;
+      }
+
+      if (action === "pick_prev" || action === "pick_next") {
+        const meta = getVoteAuditQuickPickMeta(panel);
+        if (meta.totalPages <= 1) {
+          await interaction.update(buildVoteAuditPanelPayload(panel.panelId));
+          return;
+        }
+        if (action === "pick_prev") panel.quickPickPage = panel.quickPickPage <= 0 ? meta.totalPages - 1 : panel.quickPickPage - 1;
+        else panel.quickPickPage = panel.quickPickPage >= meta.totalPages - 1 ? 0 : panel.quickPickPage + 1;
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: `Листаю быстрый список: ${panel.quickPickKind === "evaluator" ? "оценщики" : "цели"}.` }));
+        return;
+      }
+
+      if (action === "pick_kind") {
+        panel.quickPickKind = panel.quickPickKind === "evaluator" ? "target" : "evaluator";
+        panel.quickPickPage = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: `Быстрый список переключён: ${panel.quickPickKind === "evaluator" ? "оценщики" : "цели"}.` }));
+        return;
+      }
+
+      if (action === "pick_clear") {
+        if (panel.quickPickKind === "evaluator") panel.evaluatorId = "";
+        else panel.targetId = "";
+        panel.page = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText: panel.quickPickKind === "evaluator" ? "Фильтр оценщика очищен." : "Фильтр цели очищен." }));
         return;
       }
     }
@@ -3817,14 +4173,14 @@ client.on("interactionCreate", async (interaction) => {
 
   // ----- SELECT MENU -----
   if (interaction.isStringSelectMenu()) {
-    if (interaction.customId.startsWith("vote_audit_value:")) {
+    if (interaction.customId.startsWith("vote_audit_value:") || interaction.customId.startsWith("vote_audit_person_pick:")) {
       const panelId = String(interaction.customId).split(":")[1] || "";
       const panel = getVoteAuditPanel(panelId);
       if (!panel) {
         await interaction.reply({ content: "Эта панель уже устарела. Открой её заново командой.", ephemeral: true });
         return;
       }
-      if (!isModerator(interaction.member)) {
+      if (!canUseVoteAuditTools(interaction.member, interaction.user.id)) {
         await interaction.reply({ content: "Нет прав.", ephemeral: true });
         return;
       }
@@ -3832,13 +4188,35 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
         return;
       }
-      const picked = String(interaction.values?.[0] || "all");
-      panel.value = picked === "all" ? "" : normalizeVoteValue(picked);
+
+      if (interaction.customId.startsWith("vote_audit_value:")) {
+        const picked = String(interaction.values?.[0] || "all");
+        panel.value = picked === "all" ? "" : normalizeVoteValue(picked);
+        panel.page = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId, {
+          headerText: `Фильтр по оценке: ${formatVoteAuditValueLabel(panel.value)}.`,
+        }));
+        return;
+      }
+
+      const picked = String(interaction.values?.[0] || "__noop__");
+      if (picked === "__noop__") {
+        await interaction.update(buildVoteAuditPanelPayload(panel.panelId));
+        return;
+      }
+
+      if (panel.quickPickKind === "evaluator") panel.evaluatorId = picked === "__clear__" ? "" : picked;
+      else panel.targetId = picked === "__clear__" ? "" : picked;
       panel.page = 0;
       panel.updatedAt = nowIso();
-      await interaction.update(buildVoteAuditPanelPayload(panel.panelId, {
-        headerText: `Фильтр по оценке: ${formatVoteAuditValueLabel(panel.value)}.`,
-      }));
+
+      const label = panel.quickPickKind === "evaluator" ? "оценщика" : "цели";
+      const headerText = picked === "__clear__"
+        ? `Фильтр ${label} очищен.`
+        : `Быстрый выбор ${label}: ${getPersonDisplayLabel(picked)}.`;
+
+      await interaction.update(buildVoteAuditPanelPayload(panel.panelId, { headerText }));
       return;
     }
 
@@ -3878,7 +4256,7 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({ content: "Эта панель уже устарела. Открой её заново командой.", ephemeral: true });
         return;
       }
-      if (!isModerator(interaction.member)) {
+      if (!canUseVoteAuditTools(interaction.member, interaction.user.id)) {
         await interaction.reply({ content: "Нет прав.", ephemeral: true });
         return;
       }
