@@ -2782,6 +2782,8 @@ function formatCoefficientListLines() {
 }
 
 let graphicRefreshPromise = Promise.resolve(false);
+let graphicAutoBumpTimer = null;
+const GRAPHIC_AUTO_BUMP_INTERVAL_MS = 1000 * 60 * 30;
 
 function scheduleGraphicTierlistRefresh(client) {
   graphicRefreshPromise = graphicRefreshPromise
@@ -2795,6 +2797,67 @@ function scheduleGraphicTierlistRefresh(client) {
       }
     });
   return graphicRefreshPromise;
+}
+
+async function ensureGraphicMessageNotPinned(msg) {
+  if (!msg?.pinned) return false;
+  try {
+    await msg.unpin("Auto-unpin graphic tierlist dashboard");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getGraphicTierlistChannel(client) {
+  const state = getGraphicTierlistState();
+  const channelId = state.dashboardChannelId || GRAPHIC_TIERLIST_CHANNEL_ID;
+  if (!channelId) return null;
+  const channel = await client.channels.fetch(channelId).catch(() => null);
+  return channel?.isTextBased() ? channel : null;
+}
+
+async function hasMessagesAfterGraphicDashboard(client) {
+  const state = getGraphicTierlistState();
+  const channel = await getGraphicTierlistChannel(client);
+  if (!channel || !state.dashboardMessageId) return false;
+
+  const msg = await channel.messages.fetch(state.dashboardMessageId).catch(() => null);
+  if (!msg) return true;
+
+  await ensureGraphicMessageNotPinned(msg).catch(() => false);
+
+  const latestBatch = await channel.messages.fetch({ limit: 1 }).catch(() => null);
+  const latestMsg = latestBatch?.first?.() || null;
+  if (!latestMsg) return false;
+  return latestMsg.id !== msg.id && latestMsg.createdTimestamp >= msg.createdTimestamp;
+}
+
+async function maybeAutoBumpGraphicTierlist(client) {
+  const state = getGraphicTierlistState();
+  const channel = await getGraphicTierlistChannel(client);
+  if (!channel) return false;
+
+  if (!state.dashboardMessageId) {
+    await ensureGraphicTierlistMessage(client, channel.id);
+    return true;
+  }
+
+  const hasLaterMessages = await hasMessagesAfterGraphicDashboard(client);
+  if (!hasLaterMessages) return false;
+
+  return await bumpGraphicTierlist(client);
+}
+
+function startGraphicTierlistAutoBump(client) {
+  if (graphicAutoBumpTimer) clearInterval(graphicAutoBumpTimer);
+  graphicAutoBumpTimer = setInterval(() => {
+    void maybeAutoBumpGraphicTierlist(client).catch((err) => {
+      console.error("Graphic auto-bump failed:", err?.message || err);
+    });
+  }, GRAPHIC_AUTO_BUMP_INTERVAL_MS);
+  if (typeof graphicAutoBumpTimer.unref === "function") graphicAutoBumpTimer.unref();
+  return graphicAutoBumpTimer;
 }
 
 function buildGraphicDashboardComponents() {
@@ -2837,11 +2900,12 @@ async function ensureGraphicTierlistMessage(client, forcedChannelId = null) {
 
   if (!msg) {
     msg = await channel.send({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents() });
-    try { await msg.pin(); } catch {}
     state.dashboardMessageId = msg.id;
   } else {
     await msg.edit({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents(), attachments: [] });
   }
+
+  await ensureGraphicMessageNotPinned(msg).catch(() => false);
 
   state.dashboardChannelId = channelId;
   state.lastUpdated = Date.now();
@@ -2879,6 +2943,7 @@ async function refreshGraphicTierlist(client) {
     .setImage("attachment://people-tierlist.png");
 
   await msg.edit({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents(), attachments: [] });
+  await ensureGraphicMessageNotPinned(msg).catch(() => false);
   state.lastUpdated = Date.now();
   saveDB(db);
   return true;
@@ -2902,6 +2967,7 @@ async function bumpGraphicTierlist(client) {
 
   const oldMessageId = state.dashboardMessageId || "";
   const msg = await channel.send({ embeds: [embed], files: [attachment], components: buildGraphicDashboardComponents() });
+  await ensureGraphicMessageNotPinned(msg).catch(() => false);
 
   state.dashboardChannelId = channel.id;
   state.dashboardMessageId = msg.id;
@@ -3098,6 +3164,8 @@ client.once("ready", async () => {
     const graphic = getGraphicTierlistState();
     if (graphic.dashboardChannelId || GRAPHIC_TIERLIST_CHANNEL_ID) {
       await ensureGraphicTierlistMessage(client, graphic.dashboardChannelId || GRAPHIC_TIERLIST_CHANNEL_ID);
+      await maybeAutoBumpGraphicTierlist(client).catch(() => false);
+      startGraphicTierlistAutoBump(client);
     }
   } catch (e) {
     console.error("Graphic tierlist setup failed:", e?.message || e);
