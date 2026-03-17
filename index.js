@@ -146,7 +146,7 @@ function loadDB() {
     data.coefficientAudit ||= [];
     return data;
   } catch {
-    return { config: {}, people: {}, votes: {}, comments: {}, sessions: {}, meta: {}, legacy: {} };
+    return { config: {}, people: {}, votes: {}, comments: {}, sessions: {}, meta: {}, legacy: {}, coefficientAudit: [] };
   }
 }
 
@@ -188,6 +188,11 @@ function applyDbDefaults() {
   db.comments ||= {};
   db.coefficientAudit ||= [];
 
+  db.config.coefficients.globalRowWeights ||= { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1 };
+  db.config.coefficients.evaluatorWeights ||= {};
+  db.config.coefficients.targetBiases ||= {};
+  db.config.coefficients.rowInfluenceWeights ||= { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1, new: 1 };
+
   for (const rowId of BOARD_ROW_ORDER) {
     if (!db.config.rowLabels[rowId]) db.config.rowLabels[rowId] = DEFAULT_ROW_LABELS[rowId];
     if (!db.config.rowColors[rowId]) db.config.rowColors[rowId] = DEFAULT_ROW_COLORS[rowId];
@@ -195,15 +200,13 @@ function applyDbDefaults() {
   }
 
   for (const key of ["5", "4", "3", "2", "1", "unknown"]) {
-    const raw = Number(db.config.coefficients.globalRowWeights?.[key]);
+    const raw = Number(db.config.coefficients.globalRowWeights[key]);
     db.config.coefficients.globalRowWeights[key] = Number.isFinite(raw) && raw > 0 ? raw : 1;
   }
   for (const key of ["5", "4", "3", "2", "1", "unknown", "new"]) {
-    db.config.coefficients.rowInfluenceWeights[key] = 1;
+    const raw = Number(db.config.coefficients.rowInfluenceWeights[key]);
+    db.config.coefficients.rowInfluenceWeights[key] = Number.isFinite(raw) && raw > 0 ? raw : 1;
   }
-  db.config.coefficients.evaluatorWeights ||= {};
-  db.config.coefficients.targetBiases ||= {};
-  db.config.coefficients.rowInfluenceWeights ||= { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1, new: 1 };
 
   db.config.graphicTierlist ||= {
     title: GRAPHIC_TIERLIST_TITLE,
@@ -709,6 +712,11 @@ function getSessionDraftCommentMap(userId) {
   return map && typeof map === "object" ? map : {};
 }
 
+function clonePlain(value) {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+}
+
 function buildPersonalVoteMap(userId, options = {}) {
   const includeDraft = options.includeDraft !== false;
   const session = db.sessions?.[userId] || null;
@@ -737,6 +745,7 @@ function startReplacementSession(userId) {
   const now = nowIso();
   const preservedVotes = Object.keys(db.votes?.[userId] || {}).length;
   const preservedComments = Object.keys(db.comments?.[userId] || {}).length;
+  const previousSession = clonePlain(db.sessions?.[userId] || null);
   db.sessions ||= {};
   db.sessions[userId] = {
     userId,
@@ -753,11 +762,48 @@ function startReplacementSession(userId) {
     replaceCommitted: true,
     preservedVotes,
     preservedComments,
+    rollbackSnapshot: previousSession,
     stage: 3,
   };
   db.sessions[userId].activeTargetId = pickNextTargetForEvaluator(userId);
   saveDB(db);
   return { session: db.sessions[userId], preservedVotes, preservedComments };
+}
+
+function cancelReplacementSession(userId) {
+  const current = db.sessions?.[userId] || null;
+  if (!current?.replaceCommitted) return { ok: false, reason: "no-replacement" };
+
+  const snapshot = clonePlain(current.rollbackSnapshot || null);
+  if (snapshot && typeof snapshot === "object") db.sessions[userId] = snapshot;
+  else if (db.sessions?.[userId]) delete db.sessions[userId];
+
+  saveDB(db);
+  return {
+    ok: true,
+    restoredSession: snapshot || null,
+    preservedVotes: Number(current.preservedVotes || 0),
+    preservedComments: Number(current.preservedComments || 0),
+  };
+}
+
+function removeStoredComment(evaluatorId, targetId) {
+  let removedCommitted = false;
+  let removedDraft = false;
+
+  if (db.comments?.[evaluatorId]?.[targetId]) {
+    delete db.comments[evaluatorId][targetId];
+    removedCommitted = true;
+    if (!Object.keys(db.comments[evaluatorId] || {}).length) delete db.comments[evaluatorId];
+  }
+
+  if (db.sessions?.[evaluatorId]?.draftComments?.[targetId]) {
+    delete db.sessions[evaluatorId].draftComments[targetId];
+    removedDraft = true;
+  }
+
+  if (removedCommitted || removedDraft) saveDB(db);
+  return { removedCommitted, removedDraft, removed: removedCommitted || removedDraft };
 }
 
 function stopRatingSession(userId) {
@@ -791,13 +837,16 @@ function buildStoppedRatingPayload(userId, options = {}) {
       : `Текущий личный черновик сохранён.`,
   ].filter(Boolean).join("\n");
 
+  const buttons = [
+    new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("rate_my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
+  ];
+  if (session?.replaceCommitted) buttons.push(new ButtonBuilder().setCustomId("rate_cancel_reset").setLabel("Отменить переоценку").setStyle(ButtonStyle.Secondary));
+
   return {
     embeds: [new EmbedBuilder().setTitle("Оценивание остановлено").setDescription(desc)],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("rate_my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
-    )],
+    components: [new ActionRowBuilder().addComponents(...buttons)],
     ephemeral: true,
   };
 }
@@ -1893,13 +1942,11 @@ function commitSessionDrafts(userId, session) {
 
   const replacingOld = !!session.replaceCommitted;
   const replacedOldVotes = replacingOld ? Object.keys(db.votes?.[userId] || {}).length : 0;
-  const replacedOldComments = replacingOld ? Object.keys(db.comments?.[userId] || {}).length : 0;
+  const replacedOldComments = 0;
 
   if (replacingOld) {
     db.votes ||= {};
     db.votes[userId] = {};
-    db.comments ||= {};
-    db.comments[userId] = {};
   }
 
   let committedVotes = 0;
@@ -1914,9 +1961,11 @@ function commitSessionDrafts(userId, session) {
   db.comments ||= {};
   db.comments[userId] ||= {};
   for (const [targetId, comment] of Object.entries(session.draftComments || {})) {
-    const text = String(comment?.text || "").trim().slice(0, 1000);
     if (!targetId || !db.people?.[targetId] || targetId === userId) continue;
+
+    const text = String(comment?.text || "").trim().slice(0, 1000);
     if (!text) continue;
+
     const previous = db.comments[userId][targetId] || null;
     db.comments[userId][targetId] = {
       evaluatorId: userId,
@@ -2013,21 +2062,42 @@ function applyCommentFromSession(userId, sessionId, targetId, text) {
 
   const cleanText = String(text || "").trim().slice(0, 1000);
   session.draftComments ||= {};
-  if (!cleanText) delete session.draftComments[cleanTargetId];
-  else {
-    const previous = session.draftComments[cleanTargetId] || db.comments?.[userId]?.[cleanTargetId] || null;
-    session.draftComments[cleanTargetId] = {
-      evaluatorId: userId,
+  const previous = session.draftComments[cleanTargetId] || db.comments?.[userId]?.[cleanTargetId] || null;
+
+  if (!cleanText) {
+    session.updatedAt = nowIso();
+    saveDB(db);
+    return {
+      ok: true,
+      session,
       targetId: cleanTargetId,
-      text: cleanText,
-      createdAt: previous?.createdAt || nowIso(),
-      updatedAt: nowIso(),
-      sessionId,
+      comment: previous || null,
+      changed: false,
+      deletionBlocked: !!previous,
+      emptyIgnored: !previous,
     };
   }
+
+  session.draftComments[cleanTargetId] = {
+    evaluatorId: userId,
+    targetId: cleanTargetId,
+    text: cleanText,
+    deleted: false,
+    createdAt: previous?.createdAt || nowIso(),
+    updatedAt: nowIso(),
+    sessionId,
+  };
   session.updatedAt = nowIso();
   saveDB(db);
-  return { ok: true, session, targetId: cleanTargetId, comment: session.draftComments[cleanTargetId] || null };
+  return {
+    ok: true,
+    session,
+    targetId: cleanTargetId,
+    comment: session.draftComments[cleanTargetId] || null,
+    changed: true,
+    deletionBlocked: false,
+    emptyIgnored: false,
+  };
 }
 
 function formatAverage(average) {
@@ -2254,7 +2324,7 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
   return Buffer.concat(chunks);
 }
 
-async function buildMyStatusPayload(client, userId) {
+async function buildMyStatusPayload(client, userId, options = {}) {
   const person = db.people?.[userId] || null;
   const given = countVotesGivenBy(userId, { includeDraft: true });
   const received = person?.stage2Aggregate || buildAggregateForTarget(userId);
@@ -2269,6 +2339,7 @@ async function buildMyStatusPayload(client, userId) {
   const summary = new EmbedBuilder()
     .setTitle("Мой статус")
     .setDescription([
+      options.headerText || null,
       `Осталось оценить: **${remaining}** из **${eligible}**.`,
       `Ты уже оценил: **${given.total}** человек. Готовность: **${progressPct}%**.`,
       `Из твоих оценок обычных: **${given.known}**. «Не знаю»: **${given.unknown}**.`,
@@ -2291,12 +2362,15 @@ async function buildMyStatusPayload(client, userId) {
         : "Пока никто не оставлял тебе анонимных комментариев."
     );
 
+  const statusButtons = [
+    new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
+  ];
+  if (session?.replaceCommitted) statusButtons.push(new ButtonBuilder().setCustomId("rate_cancel_reset").setLabel("Отменить переоценку").setStyle(ButtonStyle.Secondary));
+
   const payload = {
     embeds: [summary, commentsEmbed],
-    components: [new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("rate_start").setLabel("Продолжить оценку").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
-    )],
+    components: [new ActionRowBuilder().addComponents(...statusButtons)],
     ephemeral: true,
   };
   const png = await renderPersonalTierlistPng(client, userId, { includeDraft: true, title: `${db.config.graphicTierlist?.title || GRAPHIC_TIERLIST_TITLE} · ${person?.username || person?.name || userId}` }).catch(() => null);
@@ -2318,21 +2392,27 @@ function buildStartRatingText(created, session = null) {
     : "Продолжаем. Ниже твоя текущая карточка на оценку. Общий тир-лист обновится, когда личный черновик закончится и сольётся.";
 }
 
-function buildRateButtons(sessionId, targetId) {
-  return [
+function buildRateButtons(sessionId, targetId, options = {}) {
+  const rows = [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:5`).setLabel("5").setStyle(getButtonStyleForRow("5", ButtonStyle.Danger)),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:4`).setLabel("4").setStyle(getButtonStyleForRow("4", ButtonStyle.Secondary)),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:3`).setLabel("3").setStyle(getButtonStyleForRow("3", ButtonStyle.Secondary)),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:2`).setLabel("2").setStyle(getButtonStyleForRow("2", ButtonStyle.Secondary)),
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:1`).setLabel("1").setStyle(getButtonStyleForRow("1", ButtonStyle.Primary)),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:5`).setLabel("5").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:4`).setLabel("4").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:3`).setLabel("3").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:2`).setLabel("2").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:1`).setLabel("1").setStyle(ButtonStyle.Secondary),
     ),
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:unknown`).setLabel("Не знаю").setStyle(getButtonStyleForRow("unknown", ButtonStyle.Secondary)),
+      new ButtonBuilder().setCustomId(`rate_vote:${sessionId}:unknown`).setLabel("Не знаю").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId(`rate_comment:${sessionId}:${targetId}`).setLabel("Оставить комментарий").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("rate_back").setLabel("Вернуться").setStyle(ButtonStyle.Secondary),
     ),
   ];
+  if (options.replacementActive) {
+    rows.push(new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId("rate_cancel_reset").setLabel("Отменить переоценку").setStyle(ButtonStyle.Secondary),
+    ));
+  }
+  return rows;
 }
 
 function buildSessionProgressLine(userId) {
@@ -2349,7 +2429,7 @@ function buildNoTargetsPayload(userId, options = {}) {
       ? "Пока в пуле нет других людей для оценки."
       : "Оценка пока завершена. Новых людей без твоей оценки сейчас нет.",
     `Ты уже раздал голосов: **${given.total}**.`,
-    options.merged ? `Новый личный тир-лист слит в общий. Комментариев слито: **${options.merged.committedComments || 0}**. Голосов слито: **${options.merged.committedVotes || 0}**.${options.merged.replacedOldVotes ? ` Старый вклад заменён: **${options.merged.replacedOldVotes}** голосов.` : ""}` : null,
+    options.merged ? `Новый личный тир-лист слит в общий. Комментариев слито: **${options.merged.committedComments || 0}**. Голосов слито: **${options.merged.committedVotes || 0}**.${options.merged.replacedOldVotes ? ` Старый вклад заменён: **${options.merged.replacedOldVotes}** голосов. Комментарии сохранены.` : ""}` : null,
     "Это сообщение исчезнет само через 10 секунд.",
   ].filter(Boolean).join("\n");
 
@@ -2397,7 +2477,7 @@ async function buildRatingCardPayload(client, userId, session, options = {}) {
 
   const payload = {
     embeds: [embed],
-    components: buildRateButtons(session.sessionId, targetId),
+    components: buildRateButtons(session.sessionId, targetId, { replacementActive: !!session?.replaceCommitted }),
     ephemeral: true,
   };
   const png = await renderPersonalTierlistPng(client, userId, { includeDraft: true, title: `Личный тир-лист ${db.people?.[userId]?.username || db.people?.[userId]?.name || userId}` }).catch(() => null);
@@ -3354,6 +3434,9 @@ function buildCommands() {
           )))
       .addSubcommand((s) => s.setName("remove-person").setDescription("Удалить человека из пула оцениваемых (модеры)")
         .addUserOption((o) => o.setName("target").setDescription("Пользователь").setRequired(true)))
+      .addSubcommand((s) => s.setName("remove-comment").setDescription("Удалить конкретный анонимный комментарий (модеры)")
+        .addUserOption((o) => o.setName("evaluator").setDescription("Кто оставил комментарий").setRequired(true))
+        .addUserOption((o) => o.setName("target").setDescription("Кому оставили комментарий").setRequired(true)))
       .addSubcommand((s) => s.setName("clear-tierlist").setDescription("Очистить тир-лист (модеры)")
         .addStringOption((o) => o.setName("mode").setDescription("Что чистить").setRequired(true)
           .addChoices(
@@ -3636,6 +3719,20 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (sub === "remove-comment") {
+      await interaction.deferReply({ ephemeral: true });
+      const evaluator = interaction.options.getUser("evaluator", true);
+      const target = interaction.options.getUser("target", true);
+      const result = removeStoredComment(evaluator.id, target.id);
+      await interaction.editReply({
+        content: result.removed
+          ? `Комментарий ${evaluator.id} -> ${target.id} удалён.${result.removedDraft ? " Черновик тоже очищен." : ""}`
+          : "Комментарий не найден.",
+      });
+      await logLine(client, `REMOVE_COMMENT evaluator=${evaluator.id} target=${target.id} committed=${result.removedCommitted} draft=${result.removedDraft} by ${interaction.user.tag}`);
+      return;
+    }
+
     if (sub === "clear-tierlist") {
       await interaction.deferReply({ ephemeral: true });
       const mode = interaction.options.getString("mode", true);
@@ -3747,6 +3844,31 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (sub === "set-row-influence") {
+      await interaction.deferReply({ ephemeral: true });
+      setRowInfluenceWeight("5", interaction.options.getNumber("r5", true));
+      setRowInfluenceWeight("4", interaction.options.getNumber("r4", true));
+      setRowInfluenceWeight("3", interaction.options.getNumber("r3", true));
+      setRowInfluenceWeight("2", interaction.options.getNumber("r2", true));
+      setRowInfluenceWeight("1", interaction.options.getNumber("r1", true));
+
+      const unknownWeight = interaction.options.getNumber("unknown", false);
+      const newWeight = interaction.options.getNumber("new", false);
+      if (Number.isFinite(unknownWeight)) setRowInfluenceWeight("unknown", unknownWeight);
+      if (Number.isFinite(newWeight)) setRowInfluenceWeight("new", newWeight);
+
+      refreshAllPeopleDerivedState();
+      pushCoefficientAudit({
+        actorId: interaction.user.id,
+        scope: "row-influence",
+        action: "set-row-influence",
+        detail: formatCoefficientListLines()[1],
+      });
+      saveDB(db);
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply({ content: `Влияние строк обновлено. ${formatCoefficientListLines()[1]}` });
+      return;
+    }
 
     return;
   }
@@ -3793,7 +3915,20 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
       const rebuild = startReplacementSession(interaction.user.id);
       await interaction.editReply(await buildRatingCardPayload(client, interaction.user.id, rebuild.session, {
-        headerText: `Начинаем полную переоценку заново. Старые голоса: ${rebuild.preservedVotes}. Старые комментарии: ${rebuild.preservedComments}. Они пока остаются в общем тир-листе и заменятся только после завершения нового личного тир-листа.`,
+        headerText: `Начинаем полную переоценку заново. Старые голоса: ${rebuild.preservedVotes}. Старые комментарии: ${rebuild.preservedComments}. Они никуда не исчезнут. Старые голоса заменятся только после завершения нового личного тир-листа, а комментарии можно удалить только командой.`,
+      }));
+      return;
+    }
+
+    if (interaction.customId === "rate_cancel_reset") {
+      await interaction.deferUpdate();
+      const result = cancelReplacementSession(interaction.user.id);
+      if (!result.ok) {
+        await interaction.followUp({ content: "Сейчас у тебя нет активной переоценки.", ephemeral: true });
+        return;
+      }
+      await interaction.editReply(await buildMyStatusPayload(client, interaction.user.id, {
+        headerText: `Полная переоценка отменена. Возвращён прошлый личный тир-лист. Старые голоса: ${result.preservedVotes}. Старые комментарии: ${result.preservedComments}.`,
       }));
       return;
     }
@@ -3843,8 +3978,8 @@ client.on("interactionCreate", async (interaction) => {
 
       const payload = await buildRatingCardPayload(client, interaction.user.id, result.session, {
         headerText: result.committed
-          ? (result.committed.replacedOldVotes || result.committed.replacedOldComments
-              ? "Голос сохранён. Новый личный тир-лист закончен и заменил твой старый вклад в общем тир-листе."
+          ? (result.committed.replacedOldVotes
+              ? "Голос сохранён. Новый личный тир-лист закончен и заменил твой старый вклад в общем тир-листе. Комментарии при этом сохранены."
               : "Голос сохранён. Личный тир-лист закончен и слит в общий.")
           : "Голос сохранён в личный тир-лист.",
         lastActionText: `Последний выбор: **${result.written.vote.value === "unknown" ? "Не знаю" : result.written.vote.value}** для **${db.people?.[result.targetId]?.username || db.people?.[result.targetId]?.name || result.targetId}**.${result.committed ? ` Слитых голосов: ${result.committed.committedVotes || 0}.` : ""}${result.committed?.replacedOldVotes ? ` Заменено старых голосов: ${result.committed.replacedOldVotes}.` : ""}`,
@@ -4244,7 +4379,12 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.reply({ content: result.reason === "stale-session" ? "Сессия уже устарела. Нажми Оценивать заново." : "Не удалось сохранить комментарий.", ephemeral: true });
         return;
       }
-      await interaction.reply({ content: result.comment?.text ? "Анонимный комментарий сохранён. Он станет доступен человеку в Мой статус, когда личный тир-лист сольётся в общий." : "Комментарий очищен.", ephemeral: true });
+      const replyText = result.changed
+        ? "Анонимный комментарий сохранён. Он станет доступен человеку в Мой статус, когда личный тир-лист сольётся в общий."
+        : (result.deletionBlocked
+            ? "Удаление комментария отключено. Старый анонимный комментарий оставлен как есть."
+            : "Пустой комментарий не сохранён.");
+      await interaction.reply({ content: replyText, ephemeral: true });
       return;
     }
 
