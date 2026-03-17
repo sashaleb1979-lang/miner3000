@@ -45,9 +45,18 @@ const GRAPHIC_AVATAR_DISK_DIR = process.env.GRAPHIC_AVATAR_CACHE_DIR || path.joi
 
 const DEFAULT_GRAPHIC_MESSAGE_TEXT = [
   "Коллективный тир-лист людей сервера.",
-  "Финальный этап активен: кнопка «Начать оценку» запускает личные карточки с 5 тирами и «не знаю».",
+  "Финальный этап активен: кнопка «Оценивать» запускает личные карточки с 5 тирами и «не знаю».",
   "Кнопка «Мой статус» показывает твой прогресс, личный тир-лист, последние действия и текущую статистику по голосам.",
 ].join(" ");
+
+const DEFAULT_GRAPHIC_GUIDE_TEXT = [
+  "Как пользоваться тир-листом.",
+  "1. Нажми «Оценивать», чтобы открыть карточки людей.",
+  "2. Ставь тир от 5 до 1 или жми «Не знаю», если человека не знаешь.",
+  "3. «Мой статус» показывает твой прогресс, личный тир-лист и статистику по тебе.",
+  "4. «Оценить заново» запускает полную переоценку твоего личного тир-листа.",
+  "5. Итоговый общий PNG тир-лист обновляется после изменений.",
+].join("\n");
 
 const BOARD_ROW_ORDER = ["5", "4", "3", "2", "1", "unknown", "new"];
 const NUMERIC_ROW_IDS = new Set(["1", "2", "3", "4", "5"]);
@@ -196,6 +205,7 @@ function applyDbDefaults() {
     panel: { selectedRowId: "5" },
     layout: { unknownBandRows: 2 },
     messageText: DEFAULT_GRAPHIC_MESSAGE_TEXT,
+    guideText: DEFAULT_GRAPHIC_GUIDE_TEXT,
   };
 
   db.config.graphicTierlist.image ||= { width: null, height: null, icon: null };
@@ -209,6 +219,7 @@ function applyDbDefaults() {
   if (!db.config.graphicTierlist.panel.selectedRowId) db.config.graphicTierlist.panel.selectedRowId = "5";
   if (!db.config.graphicTierlist.title) db.config.graphicTierlist.title = GRAPHIC_TIERLIST_TITLE;
   if (!db.config.graphicTierlist.messageText) db.config.graphicTierlist.messageText = DEFAULT_GRAPHIC_MESSAGE_TEXT;
+  if (!db.config.graphicTierlist.guideText) db.config.graphicTierlist.guideText = DEFAULT_GRAPHIC_GUIDE_TEXT;
   if (!db.config.graphicTierlist.dashboardChannelId && GRAPHIC_TIERLIST_CHANNEL_ID) {
     db.config.graphicTierlist.dashboardChannelId = GRAPHIC_TIERLIST_CHANNEL_ID;
   }
@@ -1160,6 +1171,36 @@ function resetEvaluatorProgress(userId) {
   return { clearedVotes, clearedComments };
 }
 
+function clearTierlistData(mode = "full") {
+  const normalizedMode = String(mode || "full").toLowerCase();
+  const peopleCount = Object.keys(db.people || {}).length;
+  const voteMapCount = Object.keys(db.votes || {}).length;
+  const sessionCount = Object.keys(db.sessions || {}).length;
+  const commentMapCount = Object.keys(db.comments || {}).length;
+
+  if (normalizedMode === "votes-only") {
+    db.votes = {};
+    db.comments = {};
+    db.sessions = {};
+    refreshAllPeopleDerivedState();
+    saveDB(db);
+    return { mode: normalizedMode, peopleCount, voteMapCount, sessionCount, commentMapCount };
+  }
+
+  db.people = {};
+  db.votes = {};
+  db.comments = {};
+  db.sessions = {};
+  if (db.config?.coefficients) {
+    db.config.coefficients.evaluatorWeights = {};
+    db.config.coefficients.targetBiases = {};
+  }
+  clearGraphicAvatarCache();
+  refreshAllPeopleDerivedState();
+  saveDB(db);
+  return { mode: "full", peopleCount, voteMapCount, sessionCount, commentMapCount };
+}
+
 function listCommittedVotes(filters = {}) {
   const rows = [];
   const limit = Math.max(1, Math.min(100, Number(filters.limit) || 25));
@@ -1955,7 +1996,7 @@ async function renderPersonalTierlistPng(client, userId, options = {}) {
     drawGraphicTierTitle(ctx, rowLabel, labelX, titleBoxY, labelW, titleBoxH);
     fillColor(ctx, "#111111");
     setGraphicFont(ctx, 24, "regular");
-    ctx.fillText(String(rowLabel || rowId).toUpperCase(), labelX, bottomLabelY);
+    ctx.fillText(rowId === "unknown" ? "UNKNOWN" : `TIER ${rowId}`, labelX, bottomLabelY);
 
     const rightX = leftW + 24;
     const rightY = y + 18;
@@ -2019,7 +2060,7 @@ async function buildMyStatusPayload(client, userId) {
       `Из твоих оценок обычных: **${given.known}**. «Не знаю»: **${given.unknown}**.`,
       person
         ? `Твоя текущая строка в общем тир-листе: **${getRowLabel(rowId)}**.`
-        : "Тебя ещё нет в пуле оцениваемых. Кнопка «Начать оценку» автоматически добавит тебя.",
+        : "Тебя ещё нет в пуле оцениваемых. Кнопка «Оценивать» автоматически добавит тебя.",
       `Тебя оценили: **${received.total || 0}** раз. Обычных оценок: **${received.knownCount || 0}**. «Не знаю»: **${received.unknownCount || 0}**.`,
       `Твоя средняя оценка сейчас: **${formatAverage(received.average)}**.`,
       `По кнопке «Не знаю» у тебя сейчас: **${roundedUnknownPercent}%**.${roundedUnknownPercent > UNKNOWN_ROW_PERCENT_THRESHOLD ? " Поэтому ты есть и в строке «Не знают»." : ""}`,
@@ -2170,13 +2211,36 @@ function getGraphicMessageTextModalValue() {
   return text.length <= 4000 ? text : text.slice(0, 4000);
 }
 
+function getGraphicGuideText() {
+  const state = getGraphicTierlistState();
+  const raw = String(state.guideText ?? DEFAULT_GRAPHIC_GUIDE_TEXT).trim();
+  return raw || DEFAULT_GRAPHIC_GUIDE_TEXT;
+}
+
+function getGraphicGuideTextModalValue() {
+  const text = getGraphicGuideText();
+  return text.length <= 4000 ? text : text.slice(0, 4000);
+}
+
 function previewGraphicMessageText(max = 220) {
   const text = getGraphicMessageText().replace(/\s+/g, " ").trim();
   return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
 }
 
+function previewGraphicGuideText(max = 220) {
+  const text = getGraphicGuideText().replace(/\s+/g, " ").trim();
+  return text.length <= max ? text : `${text.slice(0, Math.max(1, max - 1)).trimEnd()}…`;
+}
+
 function getGraphicDashboardEmbedDescription() {
   return getGraphicMessageText();
+}
+
+function buildGuidePayload() {
+  return {
+    embeds: [new EmbedBuilder().setTitle("Гайд").setDescription(getGraphicGuideText().slice(0, 4096))],
+    ephemeral: true,
+  };
 }
 
 function getGraphicImageConfig() {
@@ -2736,8 +2800,9 @@ function scheduleGraphicTierlistRefresh(client) {
 function buildGraphicDashboardComponents() {
   return [
     new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("rate_start").setLabel("Начать оценку").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("rate_start").setLabel("Оценивать").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("rate_my_status").setLabel("Мой статус").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("rate_guide").setLabel("Гайд").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("rate_reset_all").setLabel("Оценить заново").setStyle(ButtonStyle.Danger),
     ),
     new ActionRowBuilder().addComponents(
@@ -2889,6 +2954,7 @@ function buildGraphicPanelPayload() {
       `**Цвет строки:** ${rowColor}`,
       `**Масштаб иконок строки:** ${rowScale}`,
       `**Текст сообщения:** ${previewGraphicMessageText(170)}`,
+      `**Текст гайда:** ${previewGraphicGuideText(170)}`,
       `**Чёрная строка:** ${getUnknownBandRows()} ряда в одном горизонтальном блоке`,
       "",
       "Stage 3 завершён. Карточки, матрица голосов, финальная агрегация и PNG-панель уже работают.",
@@ -2898,6 +2964,7 @@ function buildGraphicPanelPayload() {
     new ButtonBuilder().setCustomId("graphic_panel_refresh").setLabel("Пересобрать").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("graphic_panel_title").setLabel("Название PNG").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("graphic_panel_message_text").setLabel("Текст сообщения").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId("graphic_panel_guide_text").setLabel("Текст гайда").setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId("graphic_panel_rename").setLabel("Переименовать строку").setStyle(ButtonStyle.Primary),
   );
 
@@ -2955,6 +3022,12 @@ function buildCommands() {
           )))
       .addSubcommand((s) => s.setName("remove-person").setDescription("Удалить человека из пула оцениваемых (модеры)")
         .addUserOption((o) => o.setName("target").setDescription("Пользователь").setRequired(true)))
+      .addSubcommand((s) => s.setName("clear-tierlist").setDescription("Очистить тир-лист (модеры)")
+        .addStringOption((o) => o.setName("mode").setDescription("Что чистить").setRequired(true)
+          .addChoices(
+            { name: "Полный вайп", value: "full" },
+            { name: "Только оценки", value: "votes-only" },
+          )))
       .addSubcommand((s) => s.setName("import-role").setDescription("Добавить в пул всех людей с ролью (модеры)")
         .addRoleOption((o) => o.setName("role").setDescription("Роль").setRequired(true)))
       .addSubcommand((s) => s.setName("set-row-labels").setDescription("Переименовать сразу все 7 строк (модеры)")
@@ -3118,6 +3191,7 @@ client.on("interactionCreate", async (interaction) => {
         `messageId: ${graphic.dashboardMessageId || "—"}`,
         `title: ${graphic.title || GRAPHIC_TIERLIST_TITLE}`,
         `messageText: ${previewGraphicMessageText(140)}`,
+        `guideText: ${previewGraphicGuideText(140)}`,
         `img: ${cfg.W}x${cfg.H}, icon=${cfg.ICON}, unknownBandRows=${getUnknownBandRows()}`,
         `selectedRow: ${graphic.panel?.selectedRowId || "5"} -> ${getRowLabel(graphic.panel?.selectedRowId || "5")}`,
         `people: ${Object.keys(db.people || {}).length}`,
@@ -3164,6 +3238,20 @@ client.on("interactionCreate", async (interaction) => {
       await refreshGraphicTierlist(client).catch(() => false);
       await interaction.editReply({ content: `Удалил <@${target.id}> из пула оцениваемых людей.` });
       await logLine(client, `REMOVE_PERSON ${target.id} by ${interaction.user.tag}`);
+      return;
+    }
+
+    if (sub === "clear-tierlist") {
+      await interaction.deferReply({ ephemeral: true });
+      const mode = interaction.options.getString("mode", true);
+      const result = clearTierlistData(mode);
+      await refreshGraphicTierlist(client).catch(() => false);
+      await interaction.editReply({
+        content: result.mode === "votes-only"
+          ? `Ок. Очищены только оценки. Было карт голосов: ${result.voteMapCount}, карт комментариев: ${result.commentMapCount}, сессий: ${result.sessionCount}. Люди оставлены.`
+          : `Ок. Полный вайп готов. Было людей: ${result.peopleCount}, карт голосов: ${result.voteMapCount}, карт комментариев: ${result.commentMapCount}, сессий: ${result.sessionCount}. Настройки панели сохранены.`,
+      });
+      await logLine(client, `CLEAR_TIERLIST mode=${result.mode} by ${interaction.user.tag} people=${result.peopleCount} voteMaps=${result.voteMapCount} commentMaps=${result.commentMapCount} sessions=${result.sessionCount}`);
       return;
     }
 
@@ -3286,6 +3374,11 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.customId === "rate_my_status") {
       await interaction.reply(await buildMyStatusPayload(client, interaction.user.id));
+      return;
+    }
+
+    if (interaction.customId === "rate_guide") {
+      await interaction.reply(buildGuidePayload());
       return;
     }
 
@@ -3543,6 +3636,20 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
+      if (interaction.customId === "graphic_panel_guide_text") {
+        const modal = new ModalBuilder().setCustomId("graphic_panel_guide_text_modal").setTitle("Текст гайда PNG тир-листа");
+        const input = new TextInputBuilder()
+          .setCustomId("graphic_guide_text")
+          .setLabel("Текст для кнопки «Гайд»")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(4000)
+          .setValue(getGraphicGuideTextModalValue());
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
       if (interaction.customId === "graphic_panel_rename") {
         const modal = new ModalBuilder().setCustomId(`graphic_panel_rename_modal:${selectedRowId}`).setTitle(`Переименовать строку ${selectedRowId}`);
         const input = new TextInputBuilder()
@@ -3688,7 +3795,7 @@ client.on("interactionCreate", async (interaction) => {
       const text = interaction.fields.getTextInputValue("comment_text") || "";
       const result = applyCommentFromSession(interaction.user.id, sessionId, targetId, text);
       if (!result.ok) {
-        await interaction.reply({ content: result.reason === "stale-session" ? "Сессия уже устарела. Нажми Начать оценку заново." : "Не удалось сохранить комментарий.", ephemeral: true });
+        await interaction.reply({ content: result.reason === "stale-session" ? "Сессия уже устарела. Нажми Оценивать заново." : "Не удалось сохранить комментарий.", ephemeral: true });
         return;
       }
       await interaction.reply({ content: result.comment?.text ? "Анонимный комментарий сохранён. Он станет доступен человеку в Мой статус, когда личный тир-лист сольётся в общий." : "Комментарий очищен.", ephemeral: true });
@@ -3768,6 +3875,20 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.deferReply({ ephemeral: true });
       await refreshGraphicTierlist(client).catch(() => false);
       await interaction.editReply("Ок. Текст сообщения PNG обновлён.");
+      return;
+    }
+
+    if (interaction.customId === "graphic_panel_guide_text_modal") {
+      const graphic = getGraphicTierlistState();
+      const text = (interaction.fields.getTextInputValue("graphic_guide_text") || "").trim();
+      if (!text) {
+        await interaction.reply({ content: "Пустой текст.", ephemeral: true });
+        return;
+      }
+      graphic.guideText = text.slice(0, 4000);
+      saveDB(db);
+      await interaction.deferReply({ ephemeral: true });
+      await interaction.editReply("Ок. Текст гайда обновлён.");
       return;
     }
 
