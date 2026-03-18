@@ -175,7 +175,9 @@ function applyDbDefaults() {
   db.config.autoJoinOnStartRating = true;
   db.config.stagePlan ||= STAGE_PLAN;
   db.config.sessionHistoryLimit ||= SESSION_HISTORY_LIMIT;
-  db.config.ratingFlow ||= { unknownLabel: "Не знаю", enablePreviewAggregation: true };
+  db.config.ratingFlow ||= { unknownLabel: "Не знаю", enablePreviewAggregation: true, unknownActsAsThreeFactor: 0.2 };
+  if (!Number.isFinite(Number(db.config.ratingFlow.unknownActsAsThreeFactor))) db.config.ratingFlow.unknownActsAsThreeFactor = 0.2;
+  db.config.ratingFlow.unknownActsAsThreeFactor = clampNumber(Number(db.config.ratingFlow.unknownActsAsThreeFactor), 0, 1);
   db.config.rowLabels ||= { ...DEFAULT_ROW_LABELS };
   db.config.rowColors ||= { ...DEFAULT_ROW_COLORS };
   db.config.rowIconScales ||= { ...DEFAULT_ROW_ICON_SCALES };
@@ -192,6 +194,7 @@ function applyDbDefaults() {
   db.config.coefficients.evaluatorWeights ||= {};
   db.config.coefficients.targetBiases ||= {};
   db.config.coefficients.rowInfluenceWeights ||= { "5": 1, "4": 1, "3": 1, "2": 1, "1": 1, unknown: 1, new: 1 };
+  db.config.biasAudit ||= { clusters: {} };
 
   for (const rowId of BOARD_ROW_ORDER) {
     if (!db.config.rowLabels[rowId]) db.config.rowLabels[rowId] = DEFAULT_ROW_LABELS[rowId];
@@ -206,6 +209,21 @@ function applyDbDefaults() {
   for (const key of ["5", "4", "3", "2", "1", "unknown", "new"]) {
     const raw = Number(db.config.coefficients.rowInfluenceWeights[key]);
     db.config.coefficients.rowInfluenceWeights[key] = Number.isFinite(raw) && raw > 0 ? raw : 1;
+  }
+
+  if (!db.config.biasAudit || typeof db.config.biasAudit !== "object") db.config.biasAudit = { clusters: {} };
+  db.config.biasAudit.clusters ||= {};
+  for (const [clusterId, cluster] of Object.entries(db.config.biasAudit.clusters)) {
+    const cleanId = String(clusterId || "").trim();
+    if (!cleanId) {
+      delete db.config.biasAudit.clusters[clusterId];
+      continue;
+    }
+    cluster.id = cleanId;
+    cluster.name = String(cluster.name || cleanId).trim().slice(0, 48) || cleanId;
+    cluster.roleIds = Array.from(new Set((Array.isArray(cluster.roleIds) ? cluster.roleIds : [])
+      .map((roleId) => String(roleId || "").trim())
+      .filter((roleId) => /^\d{5,25}$/.test(roleId))));
   }
 
   db.config.graphicTierlist ||= {
@@ -298,6 +316,13 @@ const voteAuditPanels = new Map();
 const VOTE_AUDIT_PAGE_SIZES = [10, 15, 25];
 const VOTE_AUDIT_QUICK_PICK_PAGE_SIZE = 24;
 const VOTE_AUDIT_TTL_MS = 1000 * 60 * 30;
+const antiBiasPanels = new Map();
+const biasClusterPanels = new Map();
+const ANTI_BIAS_CLUSTER_PAGE_SIZE = 6;
+const ANTI_BIAS_SUSPECTS_PAGE_SIZE = 4;
+const ANTI_BIAS_QUICK_PICK_PAGE_SIZE = 24;
+const ANTI_BIAS_TTL_MS = 1000 * 60 * 30;
+const BIAS_CLUSTER_CONFIG_PAGE_SIZE = 12;
 let resolvedSecretVoteAllowedUserIds = new Set(parseSecretVoteUserIds(SECRET_VOTE_USER_IDS));
 
 function nowIso() {
@@ -702,6 +727,774 @@ function getEvaluatorRowInfluence(userId) {
   return getRowInfluenceWeight(getEvaluatorBoardRowId(userId));
 }
 
+function getUnknownActsAsThreeFactor() {
+  const raw = Number(db.config?.ratingFlow?.unknownActsAsThreeFactor);
+  return Number.isFinite(raw) ? clampNumber(raw, 0, 1) : 0.2;
+}
+
+
+function getBiasAuditConfig() {
+  applyDbDefaults();
+  db.config.biasAudit ||= { clusters: {} };
+  db.config.biasAudit.clusters ||= {};
+  return db.config.biasAudit;
+}
+
+function normalizeBiasClusterId(input) {
+  return String(input || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32);
+}
+
+function getBiasCluster(clusterId) {
+  const id = normalizeBiasClusterId(clusterId);
+  return id ? (getBiasAuditConfig().clusters?.[id] || null) : null;
+}
+
+function listBiasClusters() {
+  return Object.values(getBiasAuditConfig().clusters || {}).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id), "ru"));
+}
+
+function upsertBiasCluster(clusterId, name) {
+  const id = normalizeBiasClusterId(clusterId);
+  const cleanName = String(name || "").trim().slice(0, 48);
+  if (!id || !cleanName) return null;
+  const cfg = getBiasAuditConfig();
+  cfg.clusters[id] ||= { id, name: cleanName, roleIds: [] };
+  cfg.clusters[id].id = id;
+  cfg.clusters[id].name = cleanName;
+  cfg.clusters[id].roleIds = Array.from(new Set((cfg.clusters[id].roleIds || []).map((roleId) => String(roleId || "").trim()).filter(Boolean)));
+  return cfg.clusters[id];
+}
+
+function deleteBiasCluster(clusterId) {
+  const id = normalizeBiasClusterId(clusterId);
+  const cfg = getBiasAuditConfig();
+  if (!id || !cfg.clusters?.[id]) return false;
+  delete cfg.clusters[id];
+  return true;
+}
+
+function bindRoleToBiasCluster(clusterId, roleId) {
+  const id = normalizeBiasClusterId(clusterId);
+  const cleanRoleId = String(roleId || "").trim();
+  const cluster = getBiasCluster(id);
+  if (!cluster || !/^\d{5,25}$/.test(cleanRoleId)) return false;
+  const cfg = getBiasAuditConfig();
+  for (const item of Object.values(cfg.clusters || {})) {
+    item.roleIds = (item.roleIds || []).filter((existingRoleId) => String(existingRoleId) !== cleanRoleId);
+  }
+  cluster.roleIds ||= [];
+  if (!cluster.roleIds.includes(cleanRoleId)) cluster.roleIds.push(cleanRoleId);
+  cluster.roleIds = Array.from(new Set(cluster.roleIds));
+  return true;
+}
+
+function unbindRoleFromBiasClusters(roleId) {
+  const cleanRoleId = String(roleId || "").trim();
+  if (!/^\d{5,25}$/.test(cleanRoleId)) return false;
+  let changed = false;
+  for (const cluster of Object.values(getBiasAuditConfig().clusters || {})) {
+    const before = cluster.roleIds?.length || 0;
+    cluster.roleIds = (cluster.roleIds || []).filter((existingRoleId) => String(existingRoleId) !== cleanRoleId);
+    if ((cluster.roleIds?.length || 0) !== before) changed = true;
+  }
+  return changed;
+}
+
+function createEmptyBiasDistribution() {
+  return { "5": 0, "4": 0, "3": 0, "2": 0, "1": 0, unknown: 0 };
+}
+
+function createEmptyBiasBucket() {
+  return { total: 0, known: 0, unknown: 0, sumKnown: 0, distribution: createEmptyBiasDistribution() };
+}
+
+function addVoteToBiasBucket(bucket, value) {
+  const cleanValue = normalizeVoteValue(value);
+  if (!cleanValue) return bucket;
+  bucket.total++;
+  bucket.distribution[cleanValue] = (bucket.distribution[cleanValue] || 0) + 1;
+  if (cleanValue === "unknown") bucket.unknown++;
+  else {
+    bucket.known++;
+    bucket.sumKnown += Number(cleanValue) || 0;
+  }
+  return bucket;
+}
+
+function finalizeBiasBucket(bucket) {
+  const total = Number(bucket?.total || 0);
+  const known = Number(bucket?.known || 0);
+  const distribution = bucket?.distribution || createEmptyBiasDistribution();
+  const shareOfTotal = (key) => total ? ((distribution[key] || 0) / total) * 100 : 0;
+  return {
+    total,
+    known,
+    unknown: Number(bucket?.unknown || 0),
+    average: known ? Number(bucket.sumKnown || 0) / known : null,
+    distribution,
+    shares: {
+      "5": shareOfTotal("5"),
+      "4": shareOfTotal("4"),
+      "3": shareOfTotal("3"),
+      "2": shareOfTotal("2"),
+      "1": shareOfTotal("1"),
+      unknown: shareOfTotal("unknown"),
+      high: total ? (((distribution["5"] || 0) + (distribution["4"] || 0)) / total) * 100 : 0,
+      low: total ? (((distribution["2"] || 0) + (distribution["1"] || 0)) / total) * 100 : 0,
+    },
+  };
+}
+
+function getBiasKnownShare(stats, value) {
+  const key = normalizeVoteValue(value);
+  const known = Number(stats?.known || 0);
+  if (!key || key === "unknown" || !known) return 0;
+  return (((stats?.distribution?.[key] || 0) / known) * 100) || 0;
+}
+
+function getBiasUnknownShare(stats) {
+  const total = Number(stats?.total || 0);
+  if (!total) return 0;
+  return (((stats?.distribution?.unknown || 0) / total) * 100) || 0;
+}
+
+function getBiasWeightedLowPercent(stats) {
+  const known = Number(stats?.known || 0);
+  if (!known) return 0;
+  const ones = Number(stats?.distribution?.["1"] || 0);
+  const twos = Number(stats?.distribution?.["2"] || 0);
+  return (((ones + (twos / 4)) / known) * 100) || 0;
+}
+
+function formatBiasPercent(n) {
+  const value = Number(n);
+  return `${Number.isFinite(value) ? Math.round(value) : 0}%`;
+}
+
+function formatBiasBucketLine(bucket) {
+  const stats = bucket?.distribution ? bucket : finalizeBiasBucket(bucket || createEmptyBiasBucket());
+  return [
+    `голосов ${stats.total}`,
+    `обычных ${stats.known}`,
+    `ср ${formatAverage(stats.average)}`,
+    `5 ${formatBiasPercent(getBiasKnownShare(stats, "5"))}`,
+    `4 ${formatBiasPercent(getBiasKnownShare(stats, "4"))}`,
+    `3 ${formatBiasPercent(getBiasKnownShare(stats, "3"))}`,
+    `2 ${formatBiasPercent(getBiasKnownShare(stats, "2"))}`,
+    `1 ${formatBiasPercent(getBiasKnownShare(stats, "1"))}`,
+    `? ${formatBiasPercent(getBiasUnknownShare(stats))}`,
+  ].join(" | ");
+}
+
+function formatBiasCompactDelta(delta) {
+  const n = Number(delta);
+  if (!Number.isFinite(n)) return "—";
+  return `${n >= 0 ? "+" : ""}${n.toFixed(2)}`;
+}
+
+function sortBiasClusterEntries(entries = []) {
+  entries.sort((a, b) =>
+    (Number(b.weightedLow || 0) - Number(a.weightedLow || 0)) ||
+    (b.stats.total - a.stats.total) ||
+    ((Number(b.stats.average) || 0) - (Number(a.stats.average) || 0)) ||
+    String(a.clusterName).localeCompare(String(b.clusterName), "ru")
+  );
+  return entries;
+}
+
+function buildUserClusterContext(member, userId = "") {
+  const cfg = getBiasAuditConfig();
+  const roleList = member?.roles?.cache
+    ? member.roles.cache
+        .filter((role) => role && role.id !== member.guild.id)
+        .sort((a, b) => b.position - a.position)
+        .map((role) => ({ id: role.id, name: role.name, position: Number(role.position) || 0 }))
+    : [];
+
+  const roleIdSet = new Set(roleList.map((role) => role.id));
+  const matches = [];
+  for (const cluster of Object.values(cfg.clusters || {})) {
+    const matchedRoles = roleList.filter((role) => (cluster.roleIds || []).includes(role.id));
+    if (!matchedRoles.length) continue;
+    matches.push({
+      clusterId: cluster.id,
+      clusterName: cluster.name || cluster.id,
+      matchedRoles,
+      highestPosition: Math.max(...matchedRoles.map((role) => Number(role.position) || 0)),
+    });
+  }
+  matches.sort((a, b) => (b.highestPosition - a.highestPosition) || String(a.clusterName).localeCompare(String(b.clusterName), "ru"));
+  const primary = matches[0] || null;
+
+  return {
+    userId: String(userId || member?.id || "").trim(),
+    clusterId: primary?.clusterId || "",
+    clusterName: primary?.clusterName || "Без кластера",
+    matchedRoles: primary?.matchedRoles || [],
+    matchedClusters: matches,
+    roleIds: Array.from(roleIdSet),
+    roles: roleList,
+    hasCluster: !!primary,
+  };
+}
+
+function buildAntiBiasAnalysisFromContexts(evaluatorId, contextMap = new Map()) {
+  const committedVotes = db.votes?.[evaluatorId] || {};
+  const voteRows = Object.entries(committedVotes)
+    .map(([targetId, vote]) => ({ targetId, vote, value: normalizeVoteValue(vote?.value) }))
+    .filter((row) => !!row.value && !!db.people?.[row.targetId]);
+
+  const evaluatorContext = contextMap.get(evaluatorId) || buildUserClusterContext(null, evaluatorId);
+
+  const ownBucket = createEmptyBiasBucket();
+  const otherBucket = createEmptyBiasBucket();
+  const unassignedBucket = createEmptyBiasBucket();
+  const clusterBuckets = new Map();
+
+  for (const row of voteRows) {
+    const targetContext = contextMap.get(row.targetId) || buildUserClusterContext(null, row.targetId);
+    const clusterKey = targetContext.clusterId || "__unassigned__";
+    if (!clusterBuckets.has(clusterKey)) {
+      clusterBuckets.set(clusterKey, {
+        clusterId: targetContext.clusterId || "",
+        clusterName: targetContext.clusterId ? targetContext.clusterName : "Без кластера",
+        bucket: createEmptyBiasBucket(),
+      });
+    }
+
+    addVoteToBiasBucket(clusterBuckets.get(clusterKey).bucket, row.value);
+
+    if (evaluatorContext.clusterId && targetContext.clusterId) {
+      if (evaluatorContext.clusterId === targetContext.clusterId) addVoteToBiasBucket(ownBucket, row.value);
+      else addVoteToBiasBucket(otherBucket, row.value);
+    } else {
+      addVoteToBiasBucket(unassignedBucket, row.value);
+    }
+  }
+
+  const clusterEntries = sortBiasClusterEntries(Array.from(clusterBuckets.values()).map((entry) => {
+    const stats = finalizeBiasBucket(entry.bucket);
+    return {
+      clusterId: entry.clusterId,
+      clusterName: entry.clusterName,
+      stats,
+      weightedLow: getBiasWeightedLowPercent(stats),
+      ownFiveShare: getBiasKnownShare(stats, "5"),
+    };
+  }));
+
+  const ownStats = finalizeBiasBucket(ownBucket);
+  const otherStats = finalizeBiasBucket(otherBucket);
+  const unassignedStats = finalizeBiasBucket(unassignedBucket);
+  const totalStats = finalizeBiasBucket(voteRows.reduce((bucket, row) => addVoteToBiasBucket(bucket, row.value), createEmptyBiasBucket()));
+  const suspiciousClusterEntries = clusterEntries
+    .filter((entry) => entry.clusterId && evaluatorContext.clusterId && entry.clusterId !== evaluatorContext.clusterId && entry.weightedLow > 30);
+
+  const ownFiveShare = getBiasKnownShare(ownStats, "5");
+  const maxWeightedLow = suspiciousClusterEntries.length ? Math.max(...suspiciousClusterEntries.map((entry) => Number(entry.weightedLow) || 0)) : 0;
+  const ownFiveSuspicious = ownFiveShare > 40;
+  const suspicionDeltaLow = Math.max(0, Number(maxWeightedLow || 0) - 30);
+  const suspicionDeltaOwnFive = Math.max(0, Number(ownFiveShare || 0) - 40);
+  const maxSuspicionDelta = Math.max(suspicionDeltaLow, suspicionDeltaOwnFive);
+
+  return {
+    evaluatorId,
+    evaluatorLabel: getPersonDisplayLabel(evaluatorId),
+    evaluatorContext,
+    totalVotes: voteRows.length,
+    ownStats,
+    otherStats,
+    unassignedStats,
+    totalStats,
+    clusterEntries,
+    suspiciousClusterEntries,
+    ownFiveShare,
+    maxWeightedLow,
+    ownFiveSuspicious,
+    suspicionDeltaLow,
+    suspicionDeltaOwnFive,
+    maxSuspicionDelta,
+    isSuspicious: suspiciousClusterEntries.length > 0 || ownFiveSuspicious,
+  };
+}
+
+async function buildAntiBiasDataset(client) {
+  const evaluatorIds = Object.keys(db.votes || {}).filter((userId) => Object.keys(db.votes?.[userId] || {}).length > 0);
+  const allUserIds = new Set(evaluatorIds);
+  for (const [evaluatorId, voteMap] of Object.entries(db.votes || {})) {
+    allUserIds.add(evaluatorId);
+    for (const targetId of Object.keys(voteMap || {})) {
+      if (db.people?.[targetId]) allUserIds.add(targetId);
+    }
+  }
+
+  const memberMap = await ensureGuildMembersCached(client, Array.from(allUserIds));
+  const contextMap = new Map();
+  for (const userId of allUserIds) {
+    contextMap.set(userId, buildUserClusterContext(memberMap.get(userId) || null, userId));
+  }
+
+  const analyses = evaluatorIds.map((userId) => buildAntiBiasAnalysisFromContexts(userId, contextMap));
+  const analysisMap = new Map(analyses.map((item) => [item.evaluatorId, item]));
+  const suspicious = analyses
+    .filter((item) => item.isSuspicious)
+    .sort((a, b) =>
+      (Number(b.maxSuspicionDelta || 0) - Number(a.maxSuspicionDelta || 0)) ||
+      (Number(b.maxWeightedLow || 0) - Number(a.maxWeightedLow || 0)) ||
+      (Number(b.ownFiveShare || 0) - Number(a.ownFiveShare || 0)) ||
+      (b.totalStats.total - a.totalStats.total) ||
+      String(a.evaluatorLabel).localeCompare(String(b.evaluatorLabel), "ru")
+    );
+
+  return { memberMap, contextMap, analyses, analysisMap, suspicious };
+}
+
+function getSuspiciousClusterSummaryLines(analysis, limit = 4) {
+  return (analysis?.suspiciousClusterEntries || []).slice(0, limit).map((entry) => [
+    `**${entry.clusterName}**`,
+    `низ ${formatBiasPercent(entry.weightedLow)}`,
+    `1 ${formatBiasPercent(getBiasKnownShare(entry.stats, "1"))}`,
+    `2 ${formatBiasPercent(getBiasKnownShare(entry.stats, "2"))}`,
+    `5 ${formatBiasPercent(getBiasKnownShare(entry.stats, "5"))}`,
+    `голосов ${entry.stats.known}`,
+  ].join(" | "));
+}
+
+function buildAntiBiasSuspectCardEmbed(analysis, rank = 1) {
+  const embed = new EmbedBuilder()
+    .setTitle(`#${rank} ${analysis.evaluatorLabel}`)
+    .setDescription([
+      `Кластер: **${analysis.evaluatorContext.clusterName}**`,
+      `Всего голосов: **${analysis.totalStats.total}**`,
+      `Макс подозрительный индекс: **${formatBiasPercent(analysis.maxWeightedLow)}**`,
+      `Пятёрок своим: **${formatBiasPercent(analysis.ownFiveShare)}**`,
+      `Флаги: **${analysis.suspiciousClusterEntries.length ? "чужие 1/2" : "нет"}** | **${analysis.ownFiveSuspicious ? "свои 5" : "нет"}**`,
+    ].join("\n"));
+
+  embed.addFields(
+    {
+      name: "Подозрительные кластеры",
+      value: getSuspiciousClusterSummaryLines(analysis, 5).join("\n").slice(0, 1024) || "Нет.",
+      inline: false,
+    },
+    {
+      name: "Свои",
+      value: formatBiasBucketLine(analysis.ownStats).slice(0, 1024),
+      inline: false,
+    },
+    {
+      name: "Чужие",
+      value: formatBiasBucketLine(analysis.otherStats).slice(0, 1024),
+      inline: false,
+    },
+  );
+
+  return embed;
+}
+
+function buildAntiBiasPersonEmbeds(analysis, state, headerText = "") {
+  const totalClusterPages = Math.max(1, Math.ceil((analysis?.clusterEntries?.length || 0) / ANTI_BIAS_CLUSTER_PAGE_SIZE));
+  state.page = Math.max(0, Math.min(totalClusterPages - 1, Number(state?.page) || 0));
+  const start = state.page * ANTI_BIAS_CLUSTER_PAGE_SIZE;
+  const pageEntries = (analysis?.clusterEntries || []).slice(start, start + ANTI_BIAS_CLUSTER_PAGE_SIZE);
+
+  const main = new EmbedBuilder()
+    .setTitle("Античит по человеку")
+    .setDescription([
+      headerText || `Подробная проверка для **${analysis.evaluatorLabel}**.`,
+      `Кластер: **${analysis.evaluatorContext.clusterName}**`,
+      `Всего голосов: **${analysis.totalStats.total}**`,
+      `Подозрительных кластеров: **${analysis.suspiciousClusterEntries.length}**`,
+      `Макс подозрительный индекс: **${formatBiasPercent(analysis.maxWeightedLow)}**`,
+      `Пятёрок своим: **${formatBiasPercent(analysis.ownFiveShare)}**`,
+      `Флаги: **${analysis.suspiciousClusterEntries.length ? "чужие 1/2" : "нет"}** | **${analysis.ownFiveSuspicious ? "свои 5" : "нет"}**`,
+    ].join("\n").slice(0, 4096));
+
+  main.addFields(
+    { name: "Свои", value: formatBiasBucketLine(analysis.ownStats).slice(0, 1024), inline: false },
+    { name: "Чужие", value: formatBiasBucketLine(analysis.otherStats).slice(0, 1024), inline: false },
+    { name: "Без кластера", value: formatBiasBucketLine(analysis.unassignedStats).slice(0, 1024), inline: false },
+  );
+
+  if (analysis.suspiciousClusterEntries.length) {
+    main.addFields({
+      name: "Подозрительные кластеры",
+      value: getSuspiciousClusterSummaryLines(analysis, 6).join("\n").slice(0, 1024),
+      inline: false,
+    });
+  }
+
+  const details = new EmbedBuilder()
+    .setTitle("Кластеры человека")
+    .setDescription(
+      pageEntries.length
+        ? pageEntries.map((entry, idx) => [
+            `${start + idx + 1}. **${entry.clusterName}**`,
+            `низ ${formatBiasPercent(entry.weightedLow)} | 5 ${formatBiasPercent(getBiasKnownShare(entry.stats, "5"))} | 4 ${formatBiasPercent(getBiasKnownShare(entry.stats, "4"))} | 3 ${formatBiasPercent(getBiasKnownShare(entry.stats, "3"))} | 2 ${formatBiasPercent(getBiasKnownShare(entry.stats, "2"))} | 1 ${formatBiasPercent(getBiasKnownShare(entry.stats, "1"))} | ? ${formatBiasPercent(getBiasUnknownShare(entry.stats))} | голосов ${entry.stats.total}`,
+          ].join("\n")).join("\n\n").slice(0, 4096)
+        : "Нет данных по кластерам."
+    );
+
+  return { embeds: [main, details], totalPages: totalClusterPages };
+}
+
+function cleanupAntiBiasPanels() {
+  const now = Date.now();
+  for (const [panelId, state] of antiBiasPanels.entries()) {
+    const updatedAt = new Date(state?.updatedAt || state?.createdAt || 0).getTime();
+    if (!updatedAt || now - updatedAt > ANTI_BIAS_TTL_MS) antiBiasPanels.delete(panelId);
+  }
+}
+
+function createAntiBiasPanel(ownerId, initial = {}) {
+  cleanupAntiBiasPanels();
+  const panelId = makeId().slice(0, 14);
+  const state = {
+    panelId,
+    ownerId,
+    evaluatorId: String(initial.evaluatorId || "").trim(),
+    mode: initial.evaluatorId ? "person" : "suspects",
+    page: Math.max(0, Number(initial.page) || 0),
+    quickPickPage: Math.max(0, Number(initial.quickPickPage) || 0),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+  antiBiasPanels.set(panelId, state);
+  return state;
+}
+
+function getAntiBiasPanel(panelId) {
+  cleanupAntiBiasPanels();
+  const state = antiBiasPanels.get(String(panelId || "")) || null;
+  if (!state) return null;
+  state.updatedAt = nowIso();
+  return state;
+}
+
+function getAntiBiasQuickPickEntries() {
+  const entries = [];
+  for (const [userId] of Object.entries(db.votes || {})) {
+    const given = countVotesGivenBy(userId, { includeDraft: false });
+    if (!given.total) continue;
+    entries.push({
+      userId,
+      label: getPersonDisplayLabel(userId),
+      total: given.total,
+      known: given.known,
+      unknown: given.unknown,
+    });
+  }
+  entries.sort((a, b) => (b.total - a.total) || (b.known - a.known) || String(a.label).localeCompare(String(b.label), "ru"));
+  return entries;
+}
+
+function getAntiBiasQuickPickMeta(state) {
+  const entries = getAntiBiasQuickPickEntries();
+  const totalPages = Math.max(1, Math.ceil(entries.length / ANTI_BIAS_QUICK_PICK_PAGE_SIZE));
+  const page = Math.max(0, Math.min(totalPages - 1, Number(state?.quickPickPage) || 0));
+  const start = page * ANTI_BIAS_QUICK_PICK_PAGE_SIZE;
+  return {
+    entries,
+    totalPages,
+    page,
+    pageEntries: entries.slice(start, start + ANTI_BIAS_QUICK_PICK_PAGE_SIZE),
+  };
+}
+
+function buildAntiBiasQuickPickSelect(state) {
+  const meta = getAntiBiasQuickPickMeta(state);
+  const options = [{
+    label: safeVoteAuditOptionText("Сбросить выбранного человека"),
+    value: "__clear__",
+    description: "Вернуться к списку подозрительных",
+  }];
+
+  for (const [idx, entry] of meta.pageEntries.entries()) {
+    const rank = meta.page * ANTI_BIAS_QUICK_PICK_PAGE_SIZE + idx + 1;
+    options.push({
+      label: safeVoteAuditOptionText(`${rank}. ${entry.label}`, entry.userId),
+      value: String(entry.userId),
+      description: safeVoteAuditOptionText(`дал ${entry.total} | обычных ${entry.known} | не знаю ${entry.unknown}`, "Без статистики"),
+      default: state?.evaluatorId === entry.userId,
+    });
+  }
+
+  if (options.length === 1) {
+    options.push({ label: "Пока пусто", value: "__noop__", description: "Нет оценщиков с голосами" });
+  }
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`anti_bias_pick:${state.panelId}`)
+    .setPlaceholder(`Быстрый выбор человека ${meta.page + 1}/${meta.totalPages}`)
+    .setDisabled(options.length <= 1 || (options.length === 2 && options[1].value === "__noop__"))
+    .addOptions(options.slice(0, 25));
+
+  return { select, meta };
+}
+
+function buildAntiBiasPanelComponents(state, totalPages = 1) {
+  const quickPick = buildAntiBiasQuickPickSelect(state);
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`anti_bias_suspects:${state.panelId}`).setLabel(state.mode === "suspects" ? "Подозрительные ✓" : "Подозрительные").setStyle(state.mode === "suspects" ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`anti_bias_set_eval:${state.panelId}`).setLabel(state.mode === "person" && state.evaluatorId ? "Человек ✓" : "Человек").setStyle(state.mode === "person" && state.evaluatorId ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`anti_bias_refresh:${state.panelId}`).setLabel("Обновить").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`anti_bias_clusters:${state.panelId}`).setLabel("Кластеры").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`anti_bias_close:${state.panelId}`).setLabel("Закрыть").setStyle(ButtonStyle.Danger),
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`anti_bias_prev:${state.panelId}`).setLabel("←").setStyle(ButtonStyle.Secondary).setDisabled(Number(state.page || 0) <= 0 || totalPages <= 1),
+    new ButtonBuilder().setCustomId(`anti_bias_page:${state.panelId}`).setLabel(`Стр ${Math.max(1, Number(state.page || 0) + 1)}/${Math.max(1, totalPages)}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`anti_bias_next:${state.panelId}`).setLabel("→").setStyle(ButtonStyle.Secondary).setDisabled(Number(state.page || 0) >= totalPages - 1 || totalPages <= 1),
+    new ButtonBuilder().setCustomId(`anti_bias_pick_prev:${state.panelId}`).setLabel("← люди").setStyle(ButtonStyle.Secondary).setDisabled(quickPick.meta.totalPages <= 1),
+    new ButtonBuilder().setCustomId(`anti_bias_pick_next:${state.panelId}`).setLabel("люди →").setStyle(ButtonStyle.Secondary).setDisabled(quickPick.meta.totalPages <= 1),
+  );
+
+  return [row1, row2, new ActionRowBuilder().addComponents(quickPick.select)];
+}
+
+async function buildAntiBiasPanelPayload(client, panelId, options = {}) {
+  const state = getAntiBiasPanel(panelId);
+  if (!state) {
+    return {
+      embeds: [new EmbedBuilder().setTitle("Античит-панель устарела").setDescription("Открой её заново через команду.")],
+      components: [],
+      ephemeral: true,
+    };
+  }
+
+  const clusterCount = listBiasClusters().length;
+  const dataset = await buildAntiBiasDataset(client);
+
+  if (state.mode === "person" && state.evaluatorId) {
+    const analysis = dataset.analysisMap.get(state.evaluatorId) || buildAntiBiasAnalysisFromContexts(state.evaluatorId, dataset.contextMap);
+    const built = buildAntiBiasPersonEmbeds(analysis, state, options.headerText || "");
+    return {
+      embeds: built.embeds,
+      components: buildAntiBiasPanelComponents(state, built.totalPages),
+      ephemeral: true,
+    };
+  }
+
+  state.mode = "suspects";
+  const suspects = dataset.suspicious;
+  const totalPages = Math.max(1, Math.ceil(suspects.length / ANTI_BIAS_SUSPECTS_PAGE_SIZE));
+  state.page = Math.max(0, Math.min(totalPages - 1, Number(state.page) || 0));
+  const start = state.page * ANTI_BIAS_SUSPECTS_PAGE_SIZE;
+  const pageEntries = suspects.slice(start, start + ANTI_BIAS_SUSPECTS_PAGE_SIZE);
+
+  const summary = new EmbedBuilder()
+    .setTitle("Античит-панель")
+    .setDescription([
+      options.headerText || "Список самых подозрительных оценщиков.",
+      `Настроено кластеров: **${clusterCount}**`,
+      `Проверено оценщиков: **${dataset.analyses.length}**`,
+      `Подозрительных: **${suspects.length}**`,
+      `Правила: **1% + 0.25 × 2%** по чужому кластеру. Порог: **больше 30%**.`,
+      `Отдельный флаг: если **5 своему кластеру больше 40%**, человек тоже считается подозрительным.`,
+    ].join("\n").slice(0, 4096));
+
+  const embeds = [summary];
+  if (!pageEntries.length) {
+    embeds.push(new EmbedBuilder().setTitle("Подозрительных пока нет").setDescription("Либо кластеров мало, либо никто не прошёл порог."));
+  } else {
+    for (const [idx, analysis] of pageEntries.entries()) {
+      embeds.push(buildAntiBiasSuspectCardEmbed(analysis, start + idx + 1));
+    }
+  }
+
+  return {
+    embeds,
+    components: buildAntiBiasPanelComponents(state, totalPages),
+    ephemeral: true,
+  };
+}
+
+function cleanupBiasClusterPanels() {
+  const now = Date.now();
+  for (const [panelId, state] of biasClusterPanels.entries()) {
+    const updatedAt = new Date(state?.updatedAt || state?.createdAt || 0).getTime();
+    if (!updatedAt || now - updatedAt > ANTI_BIAS_TTL_MS) biasClusterPanels.delete(panelId);
+  }
+}
+
+function createBiasClusterPanel(ownerId, initial = {}) {
+  cleanupBiasClusterPanels();
+  const clusters = listBiasClusters();
+  const panelId = makeId().slice(0, 14);
+  const state = {
+    panelId,
+    ownerId,
+    selectedClusterId: normalizeBiasClusterId(initial.selectedClusterId || clusters[0]?.id || ""),
+    page: Math.max(0, Number(initial.page) || 0),
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
+  biasClusterPanels.set(panelId, state);
+  return state;
+}
+
+function getBiasClusterPanel(panelId) {
+  cleanupBiasClusterPanels();
+  const state = biasClusterPanels.get(String(panelId || "")) || null;
+  if (!state) return null;
+  state.updatedAt = nowIso();
+  return state;
+}
+
+function getBiasClusterPanelPage(state) {
+  const clusters = listBiasClusters();
+  const totalPages = Math.max(1, Math.ceil(clusters.length / BIAS_CLUSTER_CONFIG_PAGE_SIZE));
+  state.page = Math.max(0, Math.min(totalPages - 1, Number(state?.page) || 0));
+  const start = state.page * BIAS_CLUSTER_CONFIG_PAGE_SIZE;
+  return {
+    clusters,
+    totalPages,
+    pageEntries: clusters.slice(start, start + BIAS_CLUSTER_CONFIG_PAGE_SIZE),
+    start,
+  };
+}
+
+function buildBiasClusterSelect(state) {
+  const meta = getBiasClusterPanelPage(state);
+  const options = [];
+  for (const cluster of meta.pageEntries) {
+    options.push({
+      label: safeVoteAuditOptionText(cluster.name, cluster.id),
+      value: String(cluster.id),
+      description: safeVoteAuditOptionText(`id ${cluster.id} | ролей ${cluster.roleIds?.length || 0}`, "Кластер"),
+      default: state.selectedClusterId === cluster.id,
+    });
+  }
+  if (!options.length) options.push({ label: "Пока кластеров нет", value: "__noop__", description: "Создай первый кластер" });
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(`bias_cluster_select:${state.panelId}`)
+    .setPlaceholder(`Кластеры ${Math.max(1, state.page + 1)}/${meta.totalPages}`)
+    .setDisabled(options.length === 1 && options[0].value === "__noop__")
+    .addOptions(options.slice(0, 25));
+  return { select, meta };
+}
+
+function buildBiasClusterPanelComponents(state) {
+  const selected = getBiasCluster(state.selectedClusterId);
+  const { select, meta } = buildBiasClusterSelect(state);
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`bias_cluster_create:${state.panelId}`).setLabel("Создать").setStyle(ButtonStyle.Success),
+    new ButtonBuilder().setCustomId(`bias_cluster_rename:${state.panelId}`).setLabel("Переименовать").setStyle(ButtonStyle.Primary).setDisabled(!selected),
+    new ButtonBuilder().setCustomId(`bias_cluster_delete:${state.panelId}`).setLabel("Удалить").setStyle(ButtonStyle.Danger).setDisabled(!selected),
+    new ButtonBuilder().setCustomId(`bias_cluster_bind_role:${state.panelId}`).setLabel("Привязать роль").setStyle(ButtonStyle.Secondary).setDisabled(!selected),
+    new ButtonBuilder().setCustomId(`bias_cluster_unbind_role:${state.panelId}`).setLabel("Убрать роль").setStyle(ButtonStyle.Secondary),
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`bias_cluster_prev:${state.panelId}`).setLabel("←").setStyle(ButtonStyle.Secondary).setDisabled(Number(state.page || 0) <= 0 || meta.totalPages <= 1),
+    new ButtonBuilder().setCustomId(`bias_cluster_page:${state.panelId}`).setLabel(`Стр ${Math.max(1, Number(state.page || 0) + 1)}/${meta.totalPages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`bias_cluster_next:${state.panelId}`).setLabel("→").setStyle(ButtonStyle.Secondary).setDisabled(Number(state.page || 0) >= meta.totalPages - 1 || meta.totalPages <= 1),
+    new ButtonBuilder().setCustomId(`bias_cluster_refresh:${state.panelId}`).setLabel("Обновить").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`bias_cluster_close:${state.panelId}`).setLabel("Закрыть").setStyle(ButtonStyle.Danger),
+  );
+
+  return [row1, row2, new ActionRowBuilder().addComponents(select)];
+}
+
+async function buildBiasClusterPanelPayload(client, panelId, options = {}) {
+  const state = getBiasClusterPanel(panelId);
+  if (!state) {
+    return {
+      embeds: [new EmbedBuilder().setTitle("Панель кластеров устарела").setDescription("Открой её заново через команду.")],
+      components: [],
+      ephemeral: true,
+    };
+  }
+
+  const guild = await getGuild(client).catch(() => null);
+  if (guild) await guild.roles.fetch().catch(() => null);
+
+  const clusters = listBiasClusters();
+  if (!state.selectedClusterId && clusters[0]) state.selectedClusterId = clusters[0].id;
+  if (state.selectedClusterId && !getBiasCluster(state.selectedClusterId)) state.selectedClusterId = clusters[0]?.id || "";
+
+  const selected = getBiasCluster(state.selectedClusterId);
+  const meta = getBiasClusterPanelPage(state);
+
+  const clusterLines = meta.pageEntries.length
+    ? meta.pageEntries.map((cluster, idx) => `${meta.start + idx + 1}. **${cluster.name}** [${cluster.id}] | ролей ${cluster.roleIds?.length || 0}${state.selectedClusterId === cluster.id ? " | выбрано" : ""}`)
+    : ["Кластеров пока нет. Нажми «Создать»."];
+
+  const roleLines = selected
+    ? ((selected.roleIds || []).length
+        ? (selected.roleIds || []).map((roleId) => {
+            const role = guild?.roles?.cache?.get(roleId);
+            return `${role ? `<@&${role.id}>` : roleId}${role?.name ? ` | ${role.name}` : ""}`;
+          })
+        : ["У выбранного кластера пока нет ролей."])
+    : ["Сначала выбери или создай кластер."];
+
+  const embed = new EmbedBuilder()
+    .setTitle("Настройка кластеров античита")
+    .setDescription([
+      options.headerText || "Здесь ты распределяешь роли по командам.",
+      `Кластеров: **${clusters.length}**`,
+      `Одна роль может быть только в одном кластере.`,
+      selected ? `Выбранный кластер: **${selected.name}** [${selected.id}]` : "Выбранного кластера нет.",
+    ].join("\n").slice(0, 4096));
+
+  embed.addFields(
+    {
+      name: "Кластеры на странице",
+      value: clusterLines.join("\n").slice(0, 1024),
+      inline: false,
+    },
+    {
+      name: "Роли выбранного кластера",
+      value: roleLines.join("\n").slice(0, 1024),
+      inline: false,
+    },
+  );
+
+  return {
+    embeds: [embed],
+    components: buildBiasClusterPanelComponents(state),
+    ephemeral: true,
+  };
+}
+
+async function resolveGuildRoleQuery(guild, raw) {
+  const query = String(raw || "").trim();
+  if (!query) return { ok: false, error: "Введи роль через @роль, id или точное имя." };
+  await guild.roles.fetch().catch(() => null);
+
+  const mentionId = (query.match(/<@&(\d{5,25})>/) || [])[1] || "";
+  const exactId = mentionId || ((query.match(/^(\d{5,25})$/) || [])[1] || "");
+  if (exactId) {
+    const role = guild.roles.cache.get(exactId) || null;
+    if (role) return { ok: true, role };
+    return { ok: false, error: "Роль по этому id не найдена." };
+  }
+
+  const lowered = query.toLowerCase();
+  const roles = Array.from(guild.roles.cache.values()).filter((role) => role.id !== guild.id);
+  const exact = roles.find((role) => role.name.toLowerCase() === lowered);
+  if (exact) return { ok: true, role: exact };
+
+  const partial = roles.filter((role) => role.name.toLowerCase().includes(lowered)).sort((a, b) => b.position - a.position);
+  if (!partial.length) return { ok: false, error: "Не нашёл такую роль." };
+  if (partial.length === 1) return { ok: true, role: partial[0] };
+
+  return {
+    ok: false,
+    error: `Нашёл несколько ролей. Уточни. ${partial.slice(0, 6).map((role) => role.name).join(", ")}`,
+  };
+}
+
 function getSessionDraftVoteMap(userId) {
   const map = db.sessions?.[userId]?.draftVotes;
   return map && typeof map === "object" ? map : {};
@@ -874,8 +1667,11 @@ function countVotesReceivedBy(targetId) {
   let weightedKnownSum = 0;
   let weightedKnownWeight = 0;
   let weightedUnknown = 0;
+  let weightedUnknownAsThreeSum = 0;
+  let weightedUnknownAsThreeWeight = 0;
   let lastVoteAt = "";
   const byValue = { "5": 0, "4": 0, "3": 0, "2": 0, "1": 0, unknown: 0 };
+  const unknownActsAsThreeFactor = getUnknownActsAsThreeFactor();
 
   for (const [evaluatorId, voterMap] of Object.entries(db.votes || {})) {
     const vote = voterMap?.[targetId];
@@ -893,6 +1689,9 @@ function countVotesReceivedBy(targetId) {
       unknown++;
       byValue.unknown++;
       weightedUnknown += effectiveWeight;
+      const unknownAverageWeight = effectiveWeight * unknownActsAsThreeFactor;
+      weightedUnknownAsThreeWeight += unknownAverageWeight;
+      weightedUnknownAsThreeSum += 3 * unknownAverageWeight;
     } else {
       known++;
       const numeric = Number(value) || 0;
@@ -903,7 +1702,9 @@ function countVotesReceivedBy(targetId) {
     }
   }
 
-  const baseAverage = weightedKnownWeight ? weightedKnownSum / weightedKnownWeight : null;
+  const weightedAverageSum = weightedKnownSum + weightedUnknownAsThreeSum;
+  const weightedAverageWeight = weightedKnownWeight + weightedUnknownAsThreeWeight;
+  const baseAverage = weightedAverageWeight ? weightedAverageSum / weightedAverageWeight : null;
   const bias = getTargetBias(targetId);
   const average = baseAverage == null ? null : clampNumber(baseAverage + bias, 1, 5);
   const unknownWeightTotal = weightedUnknown + weightedKnownWeight;
@@ -920,13 +1721,16 @@ function countVotesReceivedBy(targetId) {
     byValue,
     weightedKnownWeight,
     weightedUnknown,
+    weightedUnknownAsThreeWeight,
+    weightedAverageWeight,
     targetBias: bias,
+    unknownActsAsThreeFactor,
   };
 }
 
 function choosePreviewRowIdFromAggregate(agg) {
   if (!agg || !agg.total) return "new";
-  if (!agg.known) return "new";
+  if (!Number.isFinite(Number(agg.average))) return "new";
   return String(Math.max(1, Math.min(5, Math.round(agg.average || 3))));
 }
 
@@ -1057,6 +1861,9 @@ function buildAggregateForTarget(targetId) {
     lastVoteAt: received.lastVoteAt,
     weightedKnownWeight: received.weightedKnownWeight,
     weightedUnknown: received.weightedUnknown,
+    weightedUnknownAsThreeWeight: received.weightedUnknownAsThreeWeight,
+    weightedAverageWeight: received.weightedAverageWeight,
+    unknownActsAsThreeFactor: received.unknownActsAsThreeFactor,
     targetBias: received.targetBias,
     promotionThreshold: distanceMeta.promotionThreshold,
     demotionThreshold: distanceMeta.demotionThreshold,
@@ -1077,7 +1884,7 @@ function refreshAllPeopleDerivedState(save = false) {
 
     const agg = buildAggregateForTarget(userId);
     const fallbackRow = canonicalRowId(person.stage1PinnedRowId || person.previewRowId || person.legacy?.tier || "new") || "new";
-    const nextPreviewRow = agg.total > 0 ? (agg.knownCount > 0 ? agg.rowId : fallbackRow) : fallbackRow;
+    const nextPreviewRow = agg.total > 0 ? (Number.isFinite(Number(agg.average)) ? agg.rowId : fallbackRow) : fallbackRow;
     const prevAgg = JSON.stringify(person.stage2Aggregate || {});
     const nextAgg = JSON.stringify(agg);
 
@@ -3105,6 +3912,19 @@ function getCoefficientAuditLines(options = {}) {
   return entries.slice(0, limit).map((entry, index) => formatCoefficientAuditEntry(entry, index));
 }
 
+async function buildBiasClusterReportText(client) {
+  const guild = await getGuild(client).catch(() => null);
+  if (guild) await guild.roles.fetch().catch(() => null);
+  const clusters = listBiasClusters();
+  if (!clusters.length) return "Кластеры античита пока не настроены.";
+  const lines = ["Кластеры античита. Один и тот же role id хранится только в одном кластере."];
+  for (const cluster of clusters) {
+    const roleLabels = (cluster.roleIds || []).map((roleId) => guild?.roles?.cache?.get(roleId)?.name || roleId);
+    lines.push(`- ${cluster.name} [${cluster.id}] => ${roleLabels.length ? roleLabels.join(", ") : "без ролей"}`);
+  }
+  return lines.join("\n");
+}
+
 function buildCoefficientReportText(targetId = "") {
   const lines = [];
   lines.push("Текущие коэффициенты");
@@ -3480,6 +4300,9 @@ function buildCommands() {
         .addNumberOption((o) => o.setName("r1").setDescription("Влияние строки 1").setRequired(true))
         .addNumberOption((o) => o.setName("unknown").setDescription("Влияние строки не знают").setRequired(false))
         .addNumberOption((o) => o.setName("new").setDescription("Влияние строки новые").setRequired(false)))
+      .addSubcommand((s) => s.setName("bias-panel").setDescription("Античит-панель. Список подозрительных и разбор по человеку (модеры)")
+        .addUserOption((o) => o.setName("target").setDescription("Сразу открыть разбор по человеку").setRequired(false)))
+      .addSubcommand((s) => s.setName("bias-clusters").setDescription("Панель распределения ролей по кластерам античита (модеры)"))
   ].map((c) => c.toJSON());
 }
 
@@ -3631,6 +4454,24 @@ client.on("interactionCreate", async (interaction) => {
 
     if (!isModerator(interaction.member)) {
       await interaction.reply({ content: "Нет прав.", ephemeral: true });
+      return;
+    }
+
+
+    if (sub === "bias-panel") {
+      const target = interaction.options.getUser("target", false);
+      const panel = createAntiBiasPanel(interaction.user.id, { evaluatorId: target?.id || "" });
+      await interaction.reply(await buildAntiBiasPanelPayload(client, panel.panelId, {
+        headerText: target ? `Античит по человеку: ${getPersonDisplayLabel(target.id)}.` : "Античит-панель открыта.",
+      }));
+      return;
+    }
+
+    if (sub === "bias-clusters") {
+      const panel = createBiasClusterPanel(interaction.user.id);
+      await interaction.reply(await buildBiasClusterPanelPayload(client, panel.panelId, {
+        headerText: "Панель кластеров открыта.",
+      }));
       return;
     }
 
@@ -4118,6 +4959,218 @@ client.on("interactionCreate", async (interaction) => {
       }
     }
 
+
+    if (interaction.customId.startsWith("anti_bias_")) {
+      const [, action = "", panelId = ""] = String(interaction.customId).match(/^anti_bias_([^:]+):?(.*)$/) || [];
+      const panel = getAntiBiasPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта античит-панель уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+
+      if (action === "close") {
+        await interaction.update({ content: "Античит-панель закрыта.", embeds: [], components: [] });
+        return;
+      }
+
+      if (action === "suspects") {
+        panel.mode = "suspects";
+        panel.evaluatorId = "";
+        panel.page = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId, { headerText: "Показываю список подозрительных." }));
+        return;
+      }
+
+      if (action === "set_eval") {
+        const modal = new ModalBuilder().setCustomId(`anti_bias_eval_modal:${panel.panelId}`).setTitle("Человек для античита");
+        const input = new TextInputBuilder()
+          .setCustomId("audit_person_query")
+          .setLabel("ID, @упоминание или ник. Пусто = список подозрительных")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false)
+          .setMaxLength(120)
+          .setValue(panel.evaluatorId ? getPersonDisplayLabel(panel.evaluatorId).slice(0, 120) : "");
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === "refresh") {
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId, { headerText: "Античит-панель обновлена." }));
+        return;
+      }
+
+      if (action === "clusters") {
+        const clusterPanel = createBiasClusterPanel(interaction.user.id);
+        await interaction.reply(await buildBiasClusterPanelPayload(client, clusterPanel.panelId, {
+          headerText: "Открыта панель кластеров.",
+        }));
+        return;
+      }
+
+      if (action === "prev") {
+        panel.page = Math.max(0, Number(panel.page || 0) - 1);
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId));
+        return;
+      }
+
+      if (action === "next") {
+        panel.page = Math.max(0, Number(panel.page || 0) + 1);
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId));
+        return;
+      }
+
+      if (action === "pick_prev" || action === "pick_next") {
+        const meta = getAntiBiasQuickPickMeta(panel);
+        if (meta.totalPages <= 1) {
+          await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId));
+          return;
+        }
+        if (action === "pick_prev") panel.quickPickPage = panel.quickPickPage <= 0 ? meta.totalPages - 1 : panel.quickPickPage - 1;
+        else panel.quickPickPage = panel.quickPickPage >= meta.totalPages - 1 ? 0 : panel.quickPickPage + 1;
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId, { headerText: "Листаю список людей." }));
+        return;
+      }
+    }
+
+    if (interaction.customId.startsWith("bias_cluster_")) {
+      const [, action = "", panelId = ""] = String(interaction.customId).match(/^bias_cluster_([^:]+):?(.*)$/) || [];
+      const panel = getBiasClusterPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель кластеров уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+
+      if (action === "close") {
+        await interaction.update({ content: "Панель кластеров закрыта.", embeds: [], components: [] });
+        return;
+      }
+
+      if (action === "refresh") {
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildBiasClusterPanelPayload(client, panel.panelId, { headerText: "Панель кластеров обновлена." }));
+        return;
+      }
+
+      if (action === "prev") {
+        panel.page = Math.max(0, Number(panel.page || 0) - 1);
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildBiasClusterPanelPayload(client, panel.panelId));
+        return;
+      }
+
+      if (action === "next") {
+        panel.page = Math.max(0, Number(panel.page || 0) + 1);
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildBiasClusterPanelPayload(client, panel.panelId));
+        return;
+      }
+
+      if (action === "create") {
+        const modal = new ModalBuilder().setCustomId(`bias_cluster_create_modal:${panel.panelId}`).setTitle("Создать кластер");
+        const idInput = new TextInputBuilder()
+          .setCustomId("cluster_id")
+          .setLabel("ID кластера. Например red_team")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(32);
+        const nameInput = new TextInputBuilder()
+          .setCustomId("cluster_name")
+          .setLabel("Название кластера")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(48);
+        modal.addComponents(new ActionRowBuilder().addComponents(idInput), new ActionRowBuilder().addComponents(nameInput));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === "rename") {
+        const selected = getBiasCluster(panel.selectedClusterId);
+        if (!selected) {
+          await interaction.reply({ content: "Сначала выбери кластер.", ephemeral: true });
+          return;
+        }
+        const modal = new ModalBuilder().setCustomId(`bias_cluster_rename_modal:${panel.panelId}`).setTitle("Переименовать кластер");
+        const nameInput = new TextInputBuilder()
+          .setCustomId("cluster_name")
+          .setLabel("Новое название")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(48)
+          .setValue(String(selected.name || "").slice(0, 48));
+        modal.addComponents(new ActionRowBuilder().addComponents(nameInput));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === "delete") {
+        const selected = getBiasCluster(panel.selectedClusterId);
+        if (!selected) {
+          await interaction.reply({ content: "Сначала выбери кластер.", ephemeral: true });
+          return;
+        }
+        deleteBiasCluster(selected.id);
+        saveDB(db);
+        panel.selectedClusterId = listBiasClusters()[0]?.id || "";
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildBiasClusterPanelPayload(client, panel.panelId, { headerText: `Кластер ${selected.name} удалён.` }));
+        return;
+      }
+
+      if (action === "bind_role") {
+        const selected = getBiasCluster(panel.selectedClusterId);
+        if (!selected) {
+          await interaction.reply({ content: "Сначала выбери кластер.", ephemeral: true });
+          return;
+        }
+        const modal = new ModalBuilder().setCustomId(`bias_cluster_bind_role_modal:${panel.panelId}`).setTitle("Привязать роль");
+        const roleInput = new TextInputBuilder()
+          .setCustomId("role_query")
+          .setLabel("Роль через @роль, id или имя")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(120);
+        modal.addComponents(new ActionRowBuilder().addComponents(roleInput));
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (action === "unbind_role") {
+        const modal = new ModalBuilder().setCustomId(`bias_cluster_unbind_role_modal:${panel.panelId}`).setTitle("Убрать роль из кластеров");
+        const roleInput = new TextInputBuilder()
+          .setCustomId("role_query")
+          .setLabel("Роль через @роль, id или имя")
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true)
+          .setMaxLength(120);
+        modal.addComponents(new ActionRowBuilder().addComponents(roleInput));
+        await interaction.showModal(modal);
+        return;
+      }
+    }
+
     if (interaction.customId === "graphic_refresh") {
       if (!isModerator(interaction.member)) {
         await interaction.reply({ content: "Нет прав.", ephemeral: true });
@@ -4355,6 +5408,79 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
+    if (interaction.customId.startsWith("anti_bias_pick:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getAntiBiasPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта античит-панель уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+
+      const picked = String(interaction.values?.[0] || "__noop__");
+      if (picked === "__noop__") {
+        await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId));
+        return;
+      }
+
+      if (picked === "__clear__") {
+        panel.evaluatorId = "";
+        panel.mode = "suspects";
+        panel.page = 0;
+        panel.updatedAt = nowIso();
+        await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId, {
+          headerText: "Возвращаю список подозрительных.",
+        }));
+        return;
+      }
+
+      panel.evaluatorId = picked;
+      panel.mode = "person";
+      panel.page = 0;
+      panel.updatedAt = nowIso();
+      await interaction.update(await buildAntiBiasPanelPayload(client, panel.panelId, {
+        headerText: `Античит по человеку: ${getPersonDisplayLabel(picked)}.`,
+      }));
+      return;
+    }
+
+    if (interaction.customId.startsWith("bias_cluster_select:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getBiasClusterPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель кластеров уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+
+      const picked = String(interaction.values?.[0] || "__noop__");
+      if (picked === "__noop__") {
+        await interaction.update(await buildBiasClusterPanelPayload(client, panel.panelId));
+        return;
+      }
+
+      panel.selectedClusterId = normalizeBiasClusterId(picked);
+      panel.updatedAt = nowIso();
+      await interaction.update(await buildBiasClusterPanelPayload(client, panel.panelId, {
+        headerText: `Выбран кластер ${getBiasCluster(panel.selectedClusterId)?.name || panel.selectedClusterId}.`,
+      }));
+      return;
+    }
+
     if (!isModerator(interaction.member)) {
       await interaction.reply({ content: "Нет прав.", ephemeral: true });
       return;
@@ -4429,8 +5555,176 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    if (!isModerator(interaction.member)) {
-      await interaction.reply({ content: "Нет прав.", ephemeral: true });
+
+    if (interaction.customId.startsWith("anti_bias_eval_modal:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getAntiBiasPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта античит-панель уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member)) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+      if (interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Это не твоя панель.", ephemeral: true });
+        return;
+      }
+
+      const raw = interaction.fields.getTextInputValue("audit_person_query") || "";
+      const resolved = resolveVoteAuditPersonQuery(raw);
+      if (!resolved.ok) {
+        await interaction.reply({ content: resolved.error, ephemeral: true });
+        return;
+      }
+
+      panel.evaluatorId = resolved.userId || "";
+      panel.mode = resolved.userId ? "person" : "suspects";
+      panel.page = 0;
+      panel.updatedAt = nowIso();
+      const headerText = resolved.cleared
+        ? "Возвращаю список подозрительных."
+        : `Античит по человеку: ${getPersonDisplayLabel(resolved.userId)}.`;
+      const updated = await updateVoteAuditModalInteraction(interaction, await buildAntiBiasPanelPayload(client, panel.panelId, { headerText }));
+      if (!updated) await interaction.reply({ content: headerText, ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith("bias_cluster_create_modal:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getBiasClusterPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель кластеров уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member) || interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+
+      const clusterId = interaction.fields.getTextInputValue("cluster_id") || "";
+      const clusterName = interaction.fields.getTextInputValue("cluster_name") || "";
+      const cluster = upsertBiasCluster(clusterId, clusterName);
+      if (!cluster) {
+        await interaction.reply({ content: "Не удалось создать кластер. Проверь id и название.", ephemeral: true });
+        return;
+      }
+      saveDB(db);
+      panel.selectedClusterId = cluster.id;
+      panel.updatedAt = nowIso();
+      const headerText = `Кластер ${cluster.name} создан.`;
+      const updated = await updateVoteAuditModalInteraction(interaction, await buildBiasClusterPanelPayload(client, panel.panelId, { headerText }));
+      if (!updated) await interaction.reply({ content: headerText, ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith("bias_cluster_rename_modal:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getBiasClusterPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель кластеров уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member) || interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+
+      const selected = getBiasCluster(panel.selectedClusterId);
+      if (!selected) {
+        await interaction.reply({ content: "Сначала выбери кластер.", ephemeral: true });
+        return;
+      }
+
+      const clusterName = interaction.fields.getTextInputValue("cluster_name") || "";
+      const cluster = upsertBiasCluster(selected.id, clusterName);
+      if (!cluster) {
+        await interaction.reply({ content: "Не удалось переименовать кластер.", ephemeral: true });
+        return;
+      }
+      saveDB(db);
+      panel.selectedClusterId = cluster.id;
+      panel.updatedAt = nowIso();
+      const headerText = `Кластер переименован в ${cluster.name}.`;
+      const updated = await updateVoteAuditModalInteraction(interaction, await buildBiasClusterPanelPayload(client, panel.panelId, { headerText }));
+      if (!updated) await interaction.reply({ content: headerText, ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith("bias_cluster_bind_role_modal:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getBiasClusterPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель кластеров уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member) || interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+
+      const selected = getBiasCluster(panel.selectedClusterId);
+      if (!selected) {
+        await interaction.reply({ content: "Сначала выбери кластер.", ephemeral: true });
+        return;
+      }
+
+      const guild = await getGuild(client).catch(() => null);
+      if (!guild) {
+        await interaction.reply({ content: "Не удалось получить сервер.", ephemeral: true });
+        return;
+      }
+
+      const raw = interaction.fields.getTextInputValue("role_query") || "";
+      const resolved = await resolveGuildRoleQuery(guild, raw);
+      if (!resolved.ok) {
+        await interaction.reply({ content: resolved.error, ephemeral: true });
+        return;
+      }
+
+      bindRoleToBiasCluster(selected.id, resolved.role.id);
+      saveDB(db);
+      panel.updatedAt = nowIso();
+      const headerText = `Роль ${resolved.role.name} привязана к кластеру ${selected.name}.`;
+      const updated = await updateVoteAuditModalInteraction(interaction, await buildBiasClusterPanelPayload(client, panel.panelId, { headerText }));
+      if (!updated) await interaction.reply({ content: headerText, ephemeral: true });
+      return;
+    }
+
+    if (interaction.customId.startsWith("bias_cluster_unbind_role_modal:")) {
+      const panelId = String(interaction.customId).split(":")[1] || "";
+      const panel = getBiasClusterPanel(panelId);
+      if (!panel) {
+        await interaction.reply({ content: "Эта панель кластеров уже устарела. Открой её заново командой.", ephemeral: true });
+        return;
+      }
+      if (!isModerator(interaction.member) || interaction.user.id !== panel.ownerId) {
+        await interaction.reply({ content: "Нет прав.", ephemeral: true });
+        return;
+      }
+
+      const guild = await getGuild(client).catch(() => null);
+      if (!guild) {
+        await interaction.reply({ content: "Не удалось получить сервер.", ephemeral: true });
+        return;
+      }
+
+      const raw = interaction.fields.getTextInputValue("role_query") || "";
+      const resolved = await resolveGuildRoleQuery(guild, raw);
+      if (!resolved.ok) {
+        await interaction.reply({ content: resolved.error, ephemeral: true });
+        return;
+      }
+
+      const ok = unbindRoleFromBiasClusters(resolved.role.id);
+      saveDB(db);
+      panel.updatedAt = nowIso();
+      const headerText = ok
+        ? `Роль ${resolved.role.name} убрана из кластеров.`
+        : `Роль ${resolved.role.name} и так не была привязана.`;
+      const updated = await updateVoteAuditModalInteraction(interaction, await buildBiasClusterPanelPayload(client, panel.panelId, { headerText }));
+      if (!updated) await interaction.reply({ content: headerText, ephemeral: true });
       return;
     }
 
