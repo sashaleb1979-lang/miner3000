@@ -1023,6 +1023,49 @@ function buildAntiBiasAnalysisFromContexts(evaluatorId, contextMap = new Map()) 
   };
 }
 
+
+async function ensureGuildMembersCached(client, userIds = []) {
+  const memberMap = new Map();
+  const guild = client?.guilds?.cache?.get?.(GUILD_ID) || null;
+  const ids = Array.from(new Set((userIds || []).map((id) => String(id || "").trim()).filter(Boolean)));
+  if (!guild || !ids.length) return memberMap;
+
+  for (const id of ids) {
+    const cached = guild.members?.cache?.get(id);
+    if (cached) memberMap.set(id, cached);
+  }
+
+  let missing = ids.filter((id) => !memberMap.has(id));
+  if (!missing.length) return memberMap;
+
+  try {
+    const fetchedMany = await guild.members.fetch({ user: missing, force: false, cache: true });
+    if (fetchedMany?.forEach) {
+      fetchedMany.forEach((member, id) => {
+        if (member) memberMap.set(String(id), member);
+      });
+    }
+  } catch {}
+
+  missing = ids.filter((id) => !memberMap.has(id));
+  if (!missing.length) return memberMap;
+
+  const results = await Promise.allSettled(
+    missing.map(async (id) => {
+      const member = await guild.members.fetch(id).catch(() => null);
+      return [id, member];
+    })
+  );
+
+  for (const res of results) {
+    if (res.status !== "fulfilled") continue;
+    const [id, member] = res.value || [];
+    if (id && member) memberMap.set(id, member);
+  }
+
+  return memberMap;
+}
+
 async function buildAntiBiasDataset(client) {
   const evaluatorIds = Object.keys(db.votes || {}).filter((userId) => Object.keys(db.votes?.[userId] || {}).length > 0);
   const allUserIds = new Set(evaluatorIds);
